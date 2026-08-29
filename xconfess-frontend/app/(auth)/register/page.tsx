@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
+import { Button } from '@/app/components/ui/button';
 import apiClient from '@/app/lib/api/client';
 import {
   validateRegisterForm,
@@ -177,13 +178,23 @@ export default function RegisterPage() {
             />
           </div>
 
-          <button
+          <Button
+            type="button"
             onClick={doRegister}
             disabled={loading}
-            className="w-full bg-indigo-600 text-white px-4 py-2 rounded-md hover:bg-indigo-700 disabled:opacity-50"
+            className="w-full"
           >
             {loading ? 'Creating…' : 'Create account'}
-          </button>
+          </Button>
+
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => router.push('/login')}
+            className="w-full"
+          >
+            Sign in
+          </Button>
         </div>
       </div>
     </div>
