@@ -24,6 +24,12 @@ export const getTypeOrmConfig = (
     appEnv === 'dev' ||
     appEnv === 'local';
 
+  if (TRUE_VALUES.has(syncOptIn) && !isLocalDevEnv) {
+    throw new Error(
+      'TYPEORM_SYNCHRONIZE=true is only permitted in local development. Disable it and run migrations instead.',
+    );
+  }
+
   // Conservative default: never sync unless explicitly opted-in in local/dev only.
   const synchronize = isLocalDevEnv && TRUE_VALUES.has(syncOptIn);
   const migrationsRun =
