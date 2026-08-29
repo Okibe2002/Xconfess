@@ -2,9 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { createApiErrorResponse } from "@/lib/apiErrorHandler";
 import { getApiBaseUrl } from "@/app/lib/config";
 
-const BACKEND_API_URL = getApiBaseUrl();
 
 export async function GET(request: NextRequest) {
+  const BACKEND_API_URL = getApiBaseUrl();
   try {
     const token = request.headers.get("authorization")?.replace("Bearer ", "");
 
@@ -21,6 +21,7 @@ export async function GET(request: NextRequest) {
       const errData = await response.json().catch(() => ({}));
       return createApiErrorResponse(errData, {
         status: response.status,
+          upstreamResponse: response,
         fallbackMessage: "Failed to fetch preferences",
         route: "GET /api/notifications/preference"
       });
@@ -37,6 +38,7 @@ export async function GET(request: NextRequest) {
 }
 
 export async function PUT(request: NextRequest) {
+  const BACKEND_API_URL = getApiBaseUrl();
   try {
     const token = request.headers.get("authorization")?.replace("Bearer ", "");
     const body = await request.json();
@@ -57,6 +59,7 @@ export async function PUT(request: NextRequest) {
       const errData = await response.json().catch(() => ({}));
       return createApiErrorResponse(errData, {
         status: response.status,
+          upstreamResponse: response,
         fallbackMessage: "Failed to save preferences",
         route: "PUT /api/notifications/preference"
       });

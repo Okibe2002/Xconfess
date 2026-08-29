@@ -1,12 +1,12 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
-import { getApiBaseUrl } from "@/app/lib/config";
 import {
   normalizeAuthError,
   NormalizedAuthError,
 } from "@/lib/normalizeAuthError";
+import { getOrCreateRequestId, requestIdResponseHeaders } from "@/app/lib/utils/requestId";
+import { methodNotAllowed, resolveBackendRoute } from "@/app/lib/api/proxy";
 
-const API_URL = getApiBaseUrl();
 const SESSION_COOKIE_NAME = "xconfess_session";
 const MAX_RETRIES = 1;
 
@@ -16,7 +16,8 @@ const MAX_RETRIES = 1;
  */
 async function fetchBackendWithRetry(
   url: string,
-  options: RequestInit = {}
+  options: RequestInit = {},
+  requestId?: string
 ): Promise<{
   success: boolean;
   data?: Record<string, unknown>;
@@ -26,16 +27,22 @@ async function fetchBackendWithRetry(
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        ...(options.headers as Record<string, string>),
+      };
+      if (requestId) headers["x-request-id"] = requestId;
+
       const response = await fetch(url, {
         ...options,
-        headers: {
-          "Content-Type": "application/json",
-          ...options.headers,
-        },
+        headers,
       });
 
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
+        const errorData =
+          typeof response.json === "function"
+            ? await response.json().catch(() => ({}))
+            : {};
         const normalized = normalizeAuthError({
           ...errorData,
           status: response.status,
@@ -103,6 +110,7 @@ async function fetchBackendWithRetry(
 }
 
 export async function POST(request: Request) {
+    const requestId = getOrCreateRequestId(request);
     try {
         const body = await request.json();
         const email = typeof body?.email === "string" ? body.email : undefined;
@@ -117,11 +125,11 @@ export async function POST(request: Request) {
             return createErrorResponse(normalized);
         }
 
-        // Fetch with automatic retry for TRANSIENT errors
-        const result = await fetchBackendWithRetry(`${API_URL}/auth/login`, {
+        const backend = resolveBackendRoute(request, "/auth/login");
+        const result = await fetchBackendWithRetry(backend.url, {
             method: "POST",
             body: JSON.stringify({ email, password }),
-        });
+        }, backend.requestId);
 
         if (!result.success) {
             return createErrorResponse(result.normalized!);
@@ -140,17 +148,20 @@ export async function POST(request: Request) {
             path: "/",
         });
 
-        return NextResponse.json({
+        const res = NextResponse.json({
             user: data.user,
             anonymousUserId: data.anonymousUserId ?? null,
         });
+        res.headers.set("x-request-id", requestId);
+        return res;
     } catch (error) {
         const normalized = normalizeAuthError(error);
         return createErrorResponse(normalized);
     }
 }
 
-export async function GET() {
+export async function GET(request: Request) {
+    const requestId = getOrCreateRequestId(request);
     const cookieStore = await cookies();
     const token = cookieStore.get(SESSION_COOKIE_NAME)?.value;
 
@@ -165,21 +176,23 @@ export async function GET() {
 
     try {
         // Try new canonical endpoint first
-        let result = await fetchBackendWithRetry(`${API_URL}/auth/session`, {
+        let backend = resolveBackendRoute(request, "/auth/session");
+        let result = await fetchBackendWithRetry(backend.url, {
             method: "GET",
             headers: {
                 Authorization: `Bearer ${token}`,
             },
-        });
+        }, requestId);
 
         // 404 Not Found? Try fallback to legacy endpoint
         if (!result.success && result.normalized?.originalStatus === 404) {
-            result = await fetchBackendWithRetry(`${API_URL}/auth/me`, {
+            backend = resolveBackendRoute(request, "/auth/me");
+            result = await fetchBackendWithRetry(backend.url, {
                 method: "GET",
                 headers: {
                     Authorization: `Bearer ${token}`,
                 },
-            });
+            }, requestId);
         }
 
         if (!result.success) {
@@ -191,7 +204,9 @@ export async function GET() {
         }
 
         const user = result.data as Record<string, unknown>;
-        return NextResponse.json({ authenticated: true, user });
+        const response = NextResponse.json({ authenticated: true, user });
+        response.headers.set("x-request-id", requestId);
+        return response;
     } catch (error) {
         const normalized = normalizeAuthError(error);
         return createErrorResponse(normalized);
@@ -204,13 +219,19 @@ export async function DELETE() {
     return NextResponse.json({ success: true });
 }
 
+export async function PUT() {
+  return methodNotAllowed("PUT", ["GET", "POST", "DELETE"]);
+}
+
 /**
  * Convert normalized auth error to JSON response.
  * Output shape matches NormalizedAuthError so AuthProvider can consume it directly.
  */
 function createErrorResponse(normalized: NormalizedAuthError): Response {
-  // Log for debugging
-  if (process.env.NODE_ENV === "development") {
+  const isExpectedMissingSession =
+    normalized.code === "INVALID_SESSION" && normalized.originalStatus === 401;
+
+  if (process.env.NODE_ENV === "development" && !isExpectedMissingSession) {
     console.error(
       `[Auth Error] ${normalized.code} (${normalized.originalStatus || "N/A"})`,
       {

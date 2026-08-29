@@ -1,7 +1,6 @@
 'use client';
 
 import React, { createContext, useContext, useState, useEffect, useRef, ReactNode, useCallback } from 'react';
-import { useRouter } from 'next/navigation';
 import { authApi } from '../api/authService';
 import {
   AuthContextValue,
@@ -34,7 +33,6 @@ interface AuthProviderProps {
  * Manages global authentication state and provides auth methods
  */
 export function AuthProvider({ children }: AuthProviderProps) {
-  const router = useRouter();
   const setStoreUser = useAuthStore((s) => s.setUser);
   const storeLogout = useAuthStore((s) => s.logout);
   const isDevBypassEnabled =
@@ -61,7 +59,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
     const normalized = (error.details as any)?.normalized as NormalizedAuthError | undefined;
     
     if (normalized?.type === "TERMINAL") {
-      // Clear auth state immediately
       setStoreUser(null);
       storeLogout();
       setState({
@@ -69,14 +66,10 @@ export function AuthProvider({ children }: AuthProviderProps) {
         isAuthenticated: false,
         isLoading: false,
         error: null,
+        isSessionExpired: true,
       });
-
-      // Redirect to login only if not already there
-      if (typeof window !== 'undefined' && !window.location.pathname.includes('/login')) {
-        router.push('/login');
-      }
     }
-  }, [setStoreUser, storeLogout, router]);
+  }, [setStoreUser, storeLogout]);
 
   /**
   * Check if user is authenticated by validating token with backend.
@@ -85,11 +78,12 @@ export function AuthProvider({ children }: AuthProviderProps) {
   */
   const checkAuth = useCallback(async (): Promise<void> => {
     if (isDevBypassEnabled) {
+      const mockRole = process.env.NEXT_PUBLIC_DEV_MOCK_ROLE || "user";
       const mockUser = {
         id: "dev-user",
         username: "dev",
         email: "dev@example.com",
-        role: "admin",
+        role: mockRole as "user" | "admin",
       };
 
       setStoreUser(mockUser as never);
@@ -98,6 +92,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         isAuthenticated: true,
         isLoading: false,
         error: null,
+        isSessionExpired: false,
       });
       return;
     }
@@ -130,6 +125,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
           isAuthenticated: false,
           isLoading: false,
           error: null, // Don't show error for initial check
+          isSessionExpired: false,
         });
       }
     } finally {

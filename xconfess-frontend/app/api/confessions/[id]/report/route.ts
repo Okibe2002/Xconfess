@@ -1,7 +1,6 @@
 import { getApiBaseUrl } from "@/app/lib/config";
 import { createApiErrorResponse } from "@/lib/apiErrorHandler";
 
-const BASE_API_URL = getApiBaseUrl();
 
 const ALLOWED_TYPES = new Set([
   "spam",
@@ -16,6 +15,7 @@ export async function POST(
   request: Request,
   context: { params: Promise<{ id: string }> },
 ) {
+  const BASE_API_URL = getApiBaseUrl();
   try {
     const { id } = await context.params;
     if (!id) {
@@ -58,6 +58,7 @@ export async function POST(
       const errData = await res.json().catch(() => ({}));
       return createApiErrorResponse(errData, {
         status: res.status,
+          upstreamResponse: res,
         route: "POST /api/confessions/[id]/report"
       });
     }

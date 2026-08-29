@@ -1,118 +1,86 @@
 import {
   Controller,
-  Post,
-  Body,
-  UseGuards,
   Get,
-  Query,
-  UsePipes,
-  ValidationPipe,
-  BadRequestException,
+  Post,
+  Delete,
+  Param,
+  Body,
+  Req,
+  UseGuards,
 } from '@nestjs/common';
-import {
-  ApiTags,
-  ApiOperation,
-  ApiResponse,
-  ApiBearerAuth,
-  ApiQuery,
-} from '@nestjs/swagger';
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { OwnershipGuard } from '../common/guards/ownership.guard';
+import { Ownership } from '../common/decorators/ownership.decorator';
 import { MessagesService } from './messages.service';
 import { CreateMessageDto, ReplyMessageDto } from './dto/message.dto';
-import { GetMessagesQueryDto } from './dto/get-messages-query.dto';
-import { encodeCursor, CursorPaginatedResponseDto } from '../common/pagination';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard';
-import { GetUser } from '../auth/get-user.decorator';
-import { User } from '../user/entities/user.entity';
+import { RateLimitGuard } from '../auth/guard/rate-limit.guard';
+import { RateLimit } from '../auth/guard/rate-limit.decorator';
 
-@ApiTags('Messages')
-@ApiBearerAuth()
 @Controller('messages')
+@UseGuards(JwtAuthGuard)
 export class MessagesController {
   constructor(private readonly messagesService: MessagesService) {}
 
-  @UseGuards(JwtAuthGuard)
+  /**
+   * POST /messages
+   * Send a new message regarding a confession.
+   * Rate-limited per sender and sender-confession pair.
+   */
   @Post()
-  @ApiOperation({ summary: 'Send an anonymous message to a confession author' })
-  @ApiResponse({ status: 201, description: 'Message sent successfully' })
-  @ApiResponse({ status: 404, description: 'Confession not found' })
-  @UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
-  async sendMessage(@Body() dto: CreateMessageDto, @GetUser() user: User) {
-    const message = await this.messagesService.create(dto, user);
-    // Confessions are anonymous; no email notification is sent here.
-    return { success: true, messageId: message.id };
+  @UseGuards(RateLimitGuard)
+  @RateLimit(10, 60, 3, 60)
+  async createMessage(@Body() dto: CreateMessageDto, @Req() req: any) {
+    return this.messagesService.create(dto, req.user);
   }
 
-  @UseGuards(JwtAuthGuard)
+  /**
+   * POST /messages/reply
+   * Reply to an existing message.
+   * Rate-limited per sender and sender-message pair.
+   */
   @Post('reply')
-  @ApiOperation({
-    summary: 'Reply to an anonymous message (author only, single reply)',
-  })
-  @ApiResponse({ status: 200, description: 'Reply sent successfully' })
-  @ApiResponse({
-    status: 403,
-    description: 'Not the author or already replied',
-  })
-  @UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
-  async replyMessage(@Body() dto: ReplyMessageDto, @GetUser() user: User) {
-    await this.messagesService.reply(dto, user);
-    return { success: true };
+  @UseGuards(RateLimitGuard)
+  @RateLimit(10, 60, 3, 60)
+  async replyMessage(@Body() dto: ReplyMessageDto, @Req() req: any) {
+    return this.messagesService.reply(dto, req.user);
   }
 
-  @UseGuards(JwtAuthGuard)
-  @Get('threads')
-  @ApiOperation({
-    summary: 'Get all message threads for the authenticated user',
-  })
-  @UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
-  async getThreads(@Query() query: GetMessagesQueryDto, @GetUser() user: User) {
-    return this.messagesService.findAllThreadsForUser(user, query);
+  /**
+   * GET /messages/:userId/inbox
+   * Users can only read their own inbox.
+   */
+  @Get(':userId/inbox')
+  @UseGuards(OwnershipGuard)
+  @Ownership({ paramKey: 'userId' })
+  async getInbox(@Param('userId') userId: string, @Req() req: any) {
+    return this.messagesService.getInbox(req.user.sub);
   }
 
-  @UseGuards(JwtAuthGuard)
-  @Get()
-  @ApiOperation({ summary: 'Get messages for a specific confession thread' })
-  @ApiQuery({
-    name: 'confession_id',
-    required: true,
-    description: 'Confession UUID',
-  })
-  @ApiQuery({
-    name: 'sender_id',
-    required: true,
-    description: 'Sender anonymous user ID',
-  })
-  @ApiResponse({ status: 200, description: 'Messages returned successfully' })
-  @ApiResponse({ status: 403, description: 'Not part of this conversation' })
-  @UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
-  async getMessages(
-    @Query() query: GetMessagesQueryDto,
-    @GetUser() user: User,
+  /**
+   * GET /messages/thread/:threadId
+   * Verify the requester is a participant in the thread — not just authenticated.
+   */
+  @Get('thread/:threadId')
+  async getThread(@Param('threadId') threadId: string, @Req() req: any) {
+    const thread = await this.messagesService.getThreadWithParticipantCheck(
+      threadId,
+      req.user.sub,
+    );
+    return thread;
+  }
+
+  /**
+   * DELETE /messages/:userId/thread/:threadId
+   * Only the owner can delete from their view.
+   */
+  @Delete(':userId/thread/:threadId')
+  @UseGuards(OwnershipGuard)
+  @Ownership({ paramKey: 'userId' })
+  async deleteThread(
+    @Param('userId') userId: string,
+    @Param('threadId') threadId: string,
+    @Req() req: any,
   ) {
-    if (!query.confession_id || !query.sender_id) {
-      throw new BadRequestException('confession_id and sender_id are required');
-    }
-    const result = await this.messagesService.findForConfessionThread(
-      query.confession_id,
-      query.sender_id,
-      user,
-      query,
-    );
-
-    // Hide sender info for anonymity
-    const transformedData = result.data.map((m) => ({
-      id: m.id,
-      content: m.content,
-      createdAt: m.createdAt,
-      hasReply: m.hasReply,
-      replyContent: m.replyContent,
-      repliedAt: m.repliedAt,
-    }));
-
-    return new CursorPaginatedResponseDto(
-      transformedData,
-      result.nextCursor,
-      result.hasMore,
-      query.limit || 20,
-    );
+    return this.messagesService.deleteForUser(req.user.sub, threadId);
   }
 }

@@ -1,9 +1,9 @@
 import { createApiErrorResponse } from "@/lib/apiErrorHandler";
 import { getApiBaseUrl } from "@/app/lib/config";
 
-const BASE_API_URL = getApiBaseUrl();
 
 export async function GET(request: Request) {
+  const BASE_API_URL = getApiBaseUrl();
   const correlationId = request.headers.get("X-Correlation-ID") || "unknown";
 
   try {
@@ -23,6 +23,7 @@ export async function GET(request: Request) {
       const errData = await response.json().catch(() => ({}));
       return createApiErrorResponse(errData, {
         status: response.status,
+          upstreamResponse: response,
         correlationId,
         route: "GET /api/users/privacy-settings"
       });
@@ -46,6 +47,7 @@ export async function GET(request: Request) {
 }
 
 export async function PATCH(request: Request) {
+  const BASE_API_URL = getApiBaseUrl();
   const correlationId = request.headers.get("X-Correlation-ID") || "unknown";
 
   try {
@@ -68,6 +70,7 @@ export async function PATCH(request: Request) {
       const errData = await response.json().catch(() => ({}));
       return createApiErrorResponse(errData, {
         status: response.status,
+          upstreamResponse: response,
         correlationId,
         route: "PATCH /api/users/privacy-settings"
       });

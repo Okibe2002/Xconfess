@@ -1,12 +1,20 @@
 import { createApiErrorResponse } from "@/lib/apiErrorHandler";
 import { getApiBaseUrl } from "@/app/lib/config";
+import { getOrCreateRequestId } from "@/app/lib/utils/requestId";
 
-const BASE_API_URL = getApiBaseUrl();
+
+async function sha256Hex(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 
 export async function POST(
   request: Request,
   context: { params: Promise<{ confessionId: string }> },
 ) {
+  const BASE_API_URL = getApiBaseUrl();
   let body: Record<string, unknown> = {};
   let content = "";
   let anonymousContextId = "";
@@ -19,8 +27,7 @@ export async function POST(
       return createApiErrorResponse("Confession ID is required", { status: 400 });
     }
 
-    correlationId =
-      request.headers.get("X-Correlation-ID") ?? crypto.randomUUID();
+    correlationId = getOrCreateRequestId(request);
 
     body = await request.json().catch(() => ({}));
     content = (body.content ?? body.message) as string;
@@ -40,12 +47,19 @@ export async function POST(
       });
     }
 
+    // Generate a deterministic idempotency key from content + context
+    // to deduplicate retried submissions
+    const idempotencyKey = await sha256Hex(
+      `${confessionId}:${anonymousContextId}:${content.trim()}:${parentId ?? ""}`,
+    );
+
     const authHeader = request.headers.get("Authorization");
     const cookieHeader = request.headers.get("Cookie");
     const url = `${BASE_API_URL}/comments/${confessionId}`;
     const payload: Record<string, unknown> = {
       content: content.trim(),
       anonymousContextId,
+      idempotencyKey,
     };
     if (parentId != null) payload.parentId = parentId;
 
@@ -53,7 +67,7 @@ export async function POST(
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-Correlation-ID": correlationId,
+        "x-request-id": correlationId,
         ...(authHeader ? { Authorization: authHeader } : {}),
         ...(cookieHeader ? { Cookie: cookieHeader } : {}),
       },
@@ -85,7 +99,7 @@ export async function POST(
           headers: {
             "Content-Type": "application/json",
             "X-Demo-Mode": "true",
-            "X-Correlation-ID": correlationId,
+            "x-request-id": correlationId,
           },
         });
       }
@@ -93,6 +107,7 @@ export async function POST(
       const err = await response.json().catch(() => ({} as { message?: string }));
       return createApiErrorResponse(err, {
         status: response.status,
+          upstreamResponse: response,
         fallbackMessage: "Failed to post comment",
         correlationId,
         route: "POST /api/comments/[confessionId]"
@@ -113,7 +128,7 @@ export async function POST(
       status: 201,
       headers: {
         "Content-Type": "application/json",
-        "X-Correlation-ID": correlationId,
+        "x-request-id": correlationId,
       },
     });
   } catch (error) {

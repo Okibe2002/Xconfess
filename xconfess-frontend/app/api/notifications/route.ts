@@ -2,9 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { createApiErrorResponse } from "@/lib/apiErrorHandler";
 import { getApiBaseUrl } from "@/app/lib/config";
 
-const BACKEND_API_URL = getApiBaseUrl();
 
 export async function GET(request: NextRequest) {
+  const BACKEND_API_URL = getApiBaseUrl();
   const correlationId = request.headers.get("X-Correlation-ID") || "unknown";
 
   try {
@@ -32,6 +32,7 @@ export async function GET(request: NextRequest) {
       const errData = await response.json().catch(() => ({}));
       return createApiErrorResponse(errData, {
         status: response.status,
+          upstreamResponse: response,
         correlationId,
         fallbackMessage: "Failed to fetch notifications",
         route: "GET /api/notifications",

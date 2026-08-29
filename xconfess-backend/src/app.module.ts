@@ -1,4 +1,6 @@
-import { Logger, Module } from '@nestjs/common';
+﻿import { Logger, MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
+import { SanitizationMiddleware } from './middleware/sanitization.middleware';
+import { RequestIdMiddleware } from './middleware/request-id.middleware'; // ADAPT: fix path if it lives elsewhere
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { TypeOrmModule } from '@nestjs/typeorm';
@@ -16,6 +18,7 @@ import { ReactionModule } from './reaction/reaction.module';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { APP_GUARD } from '@nestjs/core';
 import throttleConfig from './config/throttle.config';
+import exportConfig from './config/export.config';
 import { HealthModule } from './health/health.module';
 import { MessagesModule } from './messages/messages.module';
 import { AdminModule } from './admin/admin.module';
@@ -31,7 +34,9 @@ import { EncryptionModule } from './encryption/encryption.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { DatabaseModule } from './database/database.module';
 import { FeatureFlagsModule } from './feature-flags/feature-flags.module';
-// ✅ Canonical queue stack: @nestjs/bullmq (BullMQ v4 + ioredis)
+import { BookmarkModule } from './bookmark/bookmark.module';
+import { KeyRotationModule } from './key-rotation/key-rotation.module';
+// âœ… Canonical queue stack: @nestjs/bullmq (BullMQ v4 + ioredis)
 // The legacy @nestjs/bull import has been removed. All queues use BullMQ.
 import { BullModule } from '@nestjs/bullmq';
 
@@ -40,7 +45,7 @@ import { BullModule } from '@nestjs/bullmq';
     ConfigModule.forRoot({
       isGlobal: true,
       envFilePath: '.env',
-      load: [throttleConfig, appConfig],
+      load: [throttleConfig, appConfig, exportConfig],
       validationSchema: envValidationSchema,
       validationOptions: { abortEarly: false },
     }),
@@ -66,7 +71,7 @@ import { BullModule } from '@nestjs/bullmq';
      *
      * A single ioredis connection object is shared across all queues via
      * BullModule.forRootAsync().  Individual queue modules call
-     * BullModule.registerQueue({ name: '...' }) — they do NOT pass their own
+     * BullModule.registerQueue({ name: '...' }) â€” they do NOT pass their own
      * connection.
      *
      * Retry semantics (defaultJobOptions) are set here so every queue inherits
@@ -91,7 +96,7 @@ import { BullModule } from '@nestjs/bullmq';
           }
         } else {
           new Logger('Bootstrap').warn(
-            'ENABLE_BACKGROUND_JOBS is not "true" — BullMQ workers are disabled. ' +
+            'ENABLE_BACKGROUND_JOBS is not "true" â€” BullMQ workers are disabled. ' +
               'Queue producers will silently skip enqueue calls. Redis connectivity is not required.',
           );
         }
@@ -105,7 +110,7 @@ import { BullModule } from '@nestjs/bullmq';
             attempts: 3,
             backoff: {
               type: 'exponential',
-              delay: 5_000, // 5 s → 10 s → 20 s
+              delay: 5_000, // 5 s â†’ 10 s â†’ 20 s
             },
             removeOnComplete: { count: 100 },
             removeOnFail: { count: 500 },
@@ -140,6 +145,8 @@ import { BullModule } from '@nestjs/bullmq';
     CacheModule,
     DatabaseModule,
     FeatureFlagsModule,
+    BookmarkModule,
+    KeyRotationModule,
   ],
   controllers: [AppController],
   providers: [
@@ -150,4 +157,10 @@ import { BullModule } from '@nestjs/bullmq';
     },
   ],
 })
-export class AppModule {}
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer) {
+    // RequestIdMiddleware first so downstream handlers/loggers can read
+    // req.requestId, and so it's set even if SanitizationMiddleware throws.
+    consumer.apply(RequestIdMiddleware, SanitizationMiddleware).forRoutes('*');
+  }
+}

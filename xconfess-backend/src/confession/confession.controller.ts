@@ -3,16 +3,24 @@ import {
   Post,
   UsePipes,
   ValidationPipe,
+  ValidationError,
+  BadRequestException,
   Body,
   Get,
+  Headers,
+  HttpStatus,
   Query,
   Param,
   Put,
   Delete,
   Req,
   Patch,
+  Res,
   UseGuards,
+  UseInterceptors,
+  Optional,
 } from '@nestjs/common';
+import { Response } from 'express';
 import { Throttle } from '@nestjs/throttler';
 import { Request } from 'express';
 import {
@@ -32,9 +40,46 @@ import { SearchConfessionDto } from './dto/search-confession.dto';
 import { UpdateConfessionDto } from './dto/update-confession.dto';
 import { OptionalJwtAuthGuard } from '../auth/optional-jwt-auth.guard';
 import { SearchDiscoveryService } from '../search-discovery/search-discovery.service';
+import { SparseFieldsetsInterceptor } from '../common/interceptors/sparse-fieldsets.interceptor';
+import { ConfessionSchedulerService } from './confession-scheduler.service';
+import { ConfessionIdempotencyService } from './confession-idempotency.service';
+
+const flattenValidationErrors = (
+  errors: ValidationError[],
+  parentPath = '',
+): Record<string, string[]> => {
+  const fieldErrors: Record<string, string[]> = {};
+
+  for (const error of errors) {
+    const path = parentPath ? `${parentPath}.${error.property}` : error.property;
+
+    if (error.constraints) {
+      fieldErrors[path] = Object.values(error.constraints);
+    }
+
+    if (error.children && error.children.length > 0) {
+      Object.assign(fieldErrors, flattenValidationErrors(error.children, path));
+    }
+  }
+
+  return fieldErrors;
+};
+
+const searchValidationPipe = new ValidationPipe({
+  transform: true,
+  whitelist: true,
+  exceptionFactory: (validationErrors: ValidationError[]) => {
+    const fields = flattenValidationErrors(validationErrors);
+    return new BadRequestException({
+      message: 'Validation failed for search parameters',
+      details: { fields },
+    });
+  },
+});
 
 @ApiTags('Confessions')
 @Controller('confessions')
+@UseInterceptors(SparseFieldsetsInterceptor)
 export class ConfessionController {
   // For testing compatibility: expose getConfessionById
   getConfessionById(id: string, req: Request) {
@@ -44,6 +89,10 @@ export class ConfessionController {
   constructor(
     private readonly service: ConfessionService,
     private readonly searchDiscoveryService: SearchDiscoveryService,
+    @Optional()
+    private readonly schedulerService: ConfessionSchedulerService,
+    @Optional()
+    private readonly idempotencyService: ConfessionIdempotencyService,
   ) {}
 
   @Post()
@@ -69,9 +118,48 @@ export class ConfessionController {
     description:
       'Validation error — message exceeds 1000 chars or invalid enum.',
   })
+  @ApiResponse({
+    status: 200,
+    description: 'Idempotent replay — the confession was already created for this Idempotency-Key.',
+  })
   @UsePipes(new ValidationPipe({ whitelist: true }))
-  create(@Body() dto: CreateConfessionDto) {
-    // Only allow canonical contract
+  async create(
+    @Body() dto: CreateConfessionDto,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    if (idempotencyKey && this.idempotencyService) {
+      const payloadHash = this.idempotencyService.computePayloadHash({
+        message: dto.message,
+        gender: (dto as any).gender ?? null,
+        tags: (dto as any).tags ?? null,
+        stellarTxHash: (dto as any).stellarTxHash ?? null,
+      });
+
+      const check = await this.idempotencyService.check(idempotencyKey, payloadHash);
+
+      if (check.isReplay && check.cachedResponse) {
+        res.status(check.cachedStatus ?? HttpStatus.CREATED);
+        return check.cachedResponse;
+      }
+
+      if (!check.isReplay) {
+        try {
+          const confession = await this.service.create(dto);
+          await this.idempotencyService.commitSuccess(
+            check.record,
+            confession as any,
+            confession as any,
+            HttpStatus.CREATED,
+          );
+          return confession;
+        } catch (err) {
+          await this.idempotencyService.commitFailure(check.record);
+          throw err;
+        }
+      }
+    }
+
     return this.service.create(dto);
   }
 
@@ -105,7 +193,7 @@ export class ConfessionController {
   @Get('search')
   @UseGuards(OptionalJwtAuthGuard)
   @ApiOperation({ summary: 'Search confessions (hybrid)' })
-  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  @UsePipes(searchValidationPipe)
   async search(@Query() dto: SearchConfessionDto, @Req() req: any) {
     const result = await this.service.search(dto);
     if (req.user && req.user.id) {
@@ -117,7 +205,7 @@ export class ConfessionController {
   @Get('search/fulltext')
   @UseGuards(OptionalJwtAuthGuard)
   @ApiOperation({ summary: 'Full-text search confessions' })
-  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  @UsePipes(searchValidationPipe)
   async fullTextSearch(@Query() dto: SearchConfessionDto, @Req() req: any) {
     const result = await this.service.fullTextSearch(dto);
     if (req.user && req.user.id) {
@@ -128,8 +216,9 @@ export class ConfessionController {
 
   @Get('trending/top')
   @ApiOperation({ summary: 'Get trending confessions' })
-  getTrending() {
-    return this.service.getTrendingConfessions();
+  @ApiQuery({ name: 'window', required: false, enum: ['24h', '7d', '30d', 'all'] })
+  getTrending(@Query('window') window?: string) {
+    return this.service.getTrendingConfessions(window || '24h');
   }
 
   @Get('tags')
@@ -203,10 +292,7 @@ export class ConfessionController {
     @Param('id') id: string,
     @Body('publishAt') publishAt: string,
   ) {
-    const schedulerService = new (
-      await import('./confession-scheduler.service')
-    ).ConfessionSchedulerService(this.service['confessionRepository']);
-    return schedulerService.scheduleConfession(id, new Date(publishAt));
+    return this.schedulerService.scheduleConfession(id, new Date(publishAt));
   }
 
   @Delete(':id/schedule')
@@ -214,10 +300,7 @@ export class ConfessionController {
   @ApiOperation({ summary: 'Cancel scheduled confession' })
   @ApiParam({ name: 'id', description: 'Confession UUID' })
   async cancelSchedule(@Param('id') id: string) {
-    const schedulerService = new (
-      await import('./confession-scheduler.service')
-    ).ConfessionSchedulerService(this.service['confessionRepository']);
-    return schedulerService.cancelSchedule(id);
+    return this.schedulerService.cancelSchedule(id);
   }
 
   @Get('user/scheduled')
@@ -228,10 +311,7 @@ export class ConfessionController {
     if (!userId) {
       return [];
     }
-    const schedulerService = new (
-      await import('./confession-scheduler.service')
-    ).ConfessionSchedulerService(this.service['confessionRepository']);
-    return schedulerService.getScheduledConfessions(userId);
+    return this.schedulerService.getScheduledConfessions(String(userId));
   }
 
   /**

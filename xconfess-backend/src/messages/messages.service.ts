@@ -27,6 +27,10 @@ import {
   CursorPaginatedResponseDto,
 } from '../common/pagination';
 import { GetMessagesQueryDto } from './dto/get-messages-query.dto';
+import {
+  ENCRYPTED_PREVIEW,
+  isEncryptedPayload,
+} from './crypto/message-e2e.crypto';
 
 @Injectable()
 export class MessagesService {
@@ -67,6 +71,12 @@ export class MessagesService {
     createMessageDto: CreateMessageDto,
     user: User,
   ): Promise<Message> {
+    if (!isEncryptedPayload(createMessageDto.content)) {
+      throw new BadRequestException(
+        'Message content must be an E2E ciphertext envelope',
+      );
+    }
+
     const confession = await this.confessionRepository.findOne({
       where: { id: createMessageDto.confession_id },
       relations: [
@@ -95,6 +105,7 @@ export class MessagesService {
         sender,
         confession,
         content: createMessageDto.content,
+        isEncrypted: true,
       });
 
       const savedMessage = await messageRepo.save(message);
@@ -110,7 +121,7 @@ export class MessagesService {
               confessionId: confession.id,
               recipientEmail,
               senderId: sender.id,
-              messagePreview: createMessageDto.content.substring(0, 100),
+              messagePreview: ENCRYPTED_PREVIEW,
             },
             idempotencyKey: `message:${savedMessage.id}`,
             status: OutboxStatus.PENDING,
@@ -272,10 +283,12 @@ export class MessagesService {
         threadsMap.set(threadId, {
           confessionId: m.confession.id,
           senderId: m.sender.id,
+          authorAnonymousUserId: m.confession.anonymousUser?.id ?? null,
           confessionMessage:
             m.confession.message.substring(0, 50) +
             (m.confession.message.length > 50 ? '...' : ''),
-          lastMessage: m.content,
+          lastMessage: m.isEncrypted ? ENCRYPTED_PREVIEW : m.content,
+          lastMessageEncrypted: m.isEncrypted,
           lastMessageAt: m.createdAt,
           hasUnread: hasUnreadForRole,
           unreadCount: hasUnreadForRole ? 1 : 0,
@@ -328,6 +341,11 @@ export class MessagesService {
     if (!dto.reply || dto.reply.trim() === '') {
       throw new BadRequestException('Reply content cannot be empty');
     }
+    if (!isEncryptedPayload(dto.reply)) {
+      throw new BadRequestException(
+        'Reply content must be an E2E ciphertext envelope',
+      );
+    }
     const message = await this.messageRepository.findOne({
       where: { id: dto.message_id },
       relations: [
@@ -358,6 +376,7 @@ export class MessagesService {
 
       message.hasReply = true;
       message.replyContent = dto.reply.trim();
+      message.isEncrypted = true;
       message.repliedAt = new Date();
       const savedReply = await messageRepo.save(message);
 
@@ -371,7 +390,7 @@ export class MessagesService {
               messageId: savedReply.id,
               confessionId: message.confession.id,
               recipientEmail,
-              replyPreview: dto.reply.substring(0, 100),
+              replyPreview: ENCRYPTED_PREVIEW,
             },
             idempotencyKey: `reply:${savedReply.id}`,
             status: OutboxStatus.PENDING,
@@ -390,5 +409,131 @@ export class MessagesService {
       return link.user.getEmail();
     }
     return null;
+  }
+
+  /**
+   * Get inbox (list of threads) for a user.
+   * Delegates to findAllThreadsForUser which uses anon ID filtering
+   * to ensure users can only see their own threads.
+   */
+  async getInbox(userId: number, query?: GetMessagesQueryDto): Promise<CursorPaginatedResponseDto<any>> {
+    const user = { id: userId } as User;
+    return this.findAllThreadsForUser(user, query || {});
+  }
+
+  /**
+   * Get a specific thread with participant verification.
+   * A user can only view a thread if they are either the confession author
+   * or the message sender (through their anonymous identities).
+   * Returns NotFound (not Forbidden) to avoid revealing thread existence.
+   */
+  async getThreadWithParticipantCheck(
+    threadId: string,
+    userId: number,
+  ): Promise<any> {
+    const [confessionId, senderId] = threadId.split('_');
+    if (!confessionId || !senderId) {
+      throw new NotFoundException('Thread not found');
+    }
+
+    const confession = await this.confessionRepository.findOne({
+      where: { id: confessionId },
+      relations: ['anonymousUser'],
+    });
+    if (!confession) throw new NotFoundException('Thread not found');
+
+    const userAnons = await this.userAnonRepo.find({
+      where: { userId },
+    });
+    const anonIds = userAnons.map((ua) => ua.anonymousUserId);
+
+    const viewerRole = this.resolveThreadViewerRole(
+      confession.anonymousUser?.id,
+      senderId,
+      anonIds,
+    );
+
+    if (!viewerRole) {
+      throw new NotFoundException('Thread not found');
+    }
+
+    const user = { id: userId } as User;
+    return this.findForConfessionThread(confessionId, senderId, user);
+  }
+
+  /**
+   * Delete (hide) a thread for a user without deleting the underlying messages.
+   * Only the thread participant can hide it from their view.
+   * Returns NotFound to avoid revealing thread existence to non-participants.
+   */
+  async deleteForUser(userId: number, threadId: string): Promise<{ success: boolean }> {
+    const [confessionId, senderId] = threadId.split('_');
+    if (!confessionId || !senderId) {
+      throw new NotFoundException('Thread not found');
+    }
+
+    const confession = await this.confessionRepository.findOne({
+      where: { id: confessionId },
+      relations: ['anonymousUser'],
+    });
+    if (!confession) throw new NotFoundException('Thread not found');
+
+    const userAnons = await this.userAnonRepo.find({
+      where: { userId },
+    });
+    const anonIds = userAnons.map((ua) => ua.anonymousUserId);
+
+    const viewerRole = this.resolveThreadViewerRole(
+      confession.anonymousUser?.id,
+      senderId,
+      anonIds,
+    );
+
+    if (!viewerRole) {
+      throw new NotFoundException('Thread not found');
+    }
+
+    // Soft-delete: mark thread as hidden for this participant role
+    const user = { id: userId } as User;
+    await this.customMessageRepository.markThreadRead(
+      confessionId,
+      senderId,
+      viewerRole,
+    );
+
+    return { success: true };
+  }
+
+  /**
+   * Verify a user can access a thread by anon identity.
+   * Returns NotFound (never Forbidden) to avoid revealing thread existence.
+   */
+  private async verifyThreadParticipant(
+    confessionId: string,
+    senderId: string,
+    userId: number,
+  ): Promise<ThreadViewerRole> {
+    const confession = await this.confessionRepository.findOne({
+      where: { id: confessionId },
+      relations: ['anonymousUser'],
+    });
+    if (!confession) throw new NotFoundException('Thread not found');
+
+    const userAnons = await this.userAnonRepo.find({
+      where: { userId },
+    });
+    const anonIds = userAnons.map((ua) => ua.anonymousUserId);
+
+    const viewerRole = this.resolveThreadViewerRole(
+      confession.anonymousUser?.id,
+      senderId,
+      anonIds,
+    );
+
+    if (!viewerRole) {
+      throw new NotFoundException('Thread not found');
+    }
+
+    return viewerRole;
   }
 }

@@ -17,6 +17,9 @@ pub mod codes {
     pub const RATE_LIMITED: u32 = 6007;
     pub const INVALID_RATE_LIMIT_CONFIG: u32 = 6008;
     pub const TOKEN_NOT_CONFIGURED: u32 = 6009;
+    pub const SETTLEMENT_REPLAY: u32 = 6010;
+    pub const SETTLEMENT_NOT_FOUND: u32 = 6011;
+    pub const RECIPIENT_MISMATCH: u32 = 6012;
 }
 
 /// Error classification for backend retry strategy
@@ -43,6 +46,9 @@ pub enum Error {
     RateLimited = 7,
     InvalidRateLimitConfig = 8,
     TokenNotConfigured = 9,
+    SettlementReplay = 10,
+    SettlementNotFound = 11,
+    RecipientMismatch = 12,
 }
 
 impl Error {
@@ -59,13 +65,16 @@ impl Error {
             Error::RateLimited => codes::RATE_LIMITED,
             Error::InvalidRateLimitConfig => codes::INVALID_RATE_LIMIT_CONFIG,
             Error::TokenNotConfigured => codes::TOKEN_NOT_CONFIGURED,
+            Error::SettlementReplay => codes::SETTLEMENT_REPLAY,
+            Error::SettlementNotFound => codes::SETTLEMENT_NOT_FOUND,
+            Error::RecipientMismatch => codes::RECIPIENT_MISMATCH,
         }
     }
 
     /// Human-readable message for this error
     pub fn message(&self) -> &'static str {
         match self {
-            Error::InvalidTipAmount => "tip amount must be positive",
+            Error::InvalidTipAmount => "tip amount must be between 0 and 10,000 XLM",
             Error::MetadataTooLong => "proof metadata too long",
             Error::TotalOverflow => "recipient total would overflow",
             Error::NonceOverflow => "settlement nonce would overflow",
@@ -74,6 +83,9 @@ impl Error {
             Error::RateLimited => "rate limit exceeded",
             Error::InvalidRateLimitConfig => "invalid rate limit configuration",
             Error::TokenNotConfigured => "xlm token contract is not configured",
+            Error::SettlementReplay => "settlement id reuse detected",
+            Error::SettlementNotFound => "settlement receipt not found",
+            Error::RecipientMismatch => "settlement recipient mismatch",
         }
     }
 
@@ -86,6 +98,9 @@ impl Error {
             Error::Unauthorized => ErrorClassification::Terminal,
             Error::InvalidRateLimitConfig => ErrorClassification::Terminal,
             Error::TokenNotConfigured => ErrorClassification::Terminal,
+            Error::SettlementReplay => ErrorClassification::Terminal,
+            Error::SettlementNotFound => ErrorClassification::Terminal,
+            Error::RecipientMismatch => ErrorClassification::Terminal,
 
             // Retryable: transient state (pause, rate limit) may resolve
             Error::ContractPaused => ErrorClassification::Retryable,
@@ -106,7 +121,7 @@ pub struct AnonymousTipping;
 /// before explicit versioning was introduced.  SCHEMA_VERSION_CURRENT is the
 /// version this WASM implements; `migrate()` brings storage up to this level.
 pub const SCHEMA_VERSION_INITIAL: u32 = 1;
-pub const SCHEMA_VERSION_CURRENT: u32 = 2;
+pub const SCHEMA_VERSION_CURRENT: u32 = 3;
 
 #[contracttype]
 #[derive(Clone)]
@@ -124,6 +139,22 @@ enum DataKey {
     /// v2: global count of all successful tip settlements across all recipients.
     /// Absent (or 0) before `migrate()` is called.
     GlobalTipCount,
+    /// v3: stores settlement receipt data keyed by settlement_id for replay
+    /// detection and cross-contract receipt verification.
+    SettlementReceipt(u64),
+}
+
+/// Persistent TTL for per-user and per-settlement data (in ledgers).
+/// 31 days ≈ 44640 ledgers at ~1 minute per ledger on Stellar.
+const PERSISTENT_TTL_LEDGERS: u32 = 44_640;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettlementReceipt {
+    pub recipient: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+    pub settlement_id: u64,
 }
 
 #[contracttype]
@@ -181,6 +212,10 @@ impl AnonymousTipping {
     pub const DEFAULT_MAX_TIPS_PER_WINDOW: u32 = 1_000;
     pub const DEFAULT_RATE_WINDOW_SECONDS: u64 = 60;
 
+    /// Maximum tip amount in stroops (10,000 XLM * 10_000_000 stroops/XLM).
+    /// Must be consistent with backend and frontend MAX_TIP_AMOUNT.
+    pub const MAX_TIP_AMOUNT: i128 = 100_000_000_000;
+
     /// Initialize the tipping contract
     pub fn init(env: Env, xlm_token: Address) {
         if env.storage().instance().has(&DataKey::SettlementNonce) {
@@ -212,6 +247,14 @@ impl AnonymousTipping {
     }
 
     /// Send anonymous tip with optional bounded settlement proof metadata.
+    ///
+    /// # Fee and rounding policy
+    /// This contract performs a direct peer-to-peer token transfer with **no platform fee**.
+    /// The full `amount` (in stroops) is credited to `recipient`. There is no fee deduction,
+    /// no rounding, and no basis-point calculation — `amount` must be an exact integer of
+    /// stroops between 1 and `MAX_TIP_AMOUNT` (inclusive). Any future fee mechanism must
+    /// document its rounding direction here; the canonical choice for fee-on-top is
+    /// round-up (ceiling) so the protocol never subsidises the sender.
     pub fn send_tip_with_proof(
         env: Env,
         sender: Address,
@@ -220,7 +263,7 @@ impl AnonymousTipping {
         proof_metadata: Option<SorobanString>,
     ) -> Result<u64, Error> {
         Self::assert_not_paused(&env)?;
-        if amount <= 0 {
+        if amount <= 0 || amount > Self::MAX_TIP_AMOUNT {
             return Err(Error::InvalidTipAmount);
         }
         sender.require_auth();
@@ -255,6 +298,12 @@ impl AnonymousTipping {
         env.storage()
             .persistent()
             .set(&DataKey::RecipientTotal(recipient.clone()), &next_total);
+        // Extend TTL on persistent storage to prevent data loss
+        env.storage().persistent().extend_ttl(
+            &DataKey::RecipientTotal(recipient.clone()),
+            PERSISTENT_TTL_LEDGERS,
+            PERSISTENT_TTL_LEDGERS,
+        );
 
         let settlement_id = env
             .storage()
@@ -267,6 +316,24 @@ impl AnonymousTipping {
             .instance()
             .set(&DataKey::SettlementNonce, &settlement_id);
 
+        // Store settlement receipt for replay detection and cross-contract
+        // verification. This allows downstream consumers and other contracts
+        // to verify a settlement occurred without re-processing events.
+        let receipt = SettlementReceipt {
+            recipient: recipient.clone(),
+            amount,
+            timestamp: env.ledger().timestamp(),
+            settlement_id,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::SettlementReceipt(settlement_id), &receipt);
+        env.storage().persistent().extend_ttl(
+            &DataKey::SettlementReceipt(settlement_id),
+            PERSISTENT_TTL_LEDGERS,
+            PERSISTENT_TTL_LEDGERS,
+        );
+
         SettlementEvent {
             recipient,
             event_version: EVENT_VERSION_V1,
@@ -274,7 +341,7 @@ impl AnonymousTipping {
             amount,
             proof_metadata: metadata.clone(),
             proof_present: !metadata.is_empty(),
-            timestamp: env.ledger().timestamp(),
+            timestamp: receipt.timestamp,
         }
         .publish(&env);
 
@@ -416,6 +483,13 @@ impl AnonymousTipping {
     /// Off-chain reconciliation should combine the pre-migration event log with
     /// the on-chain counter when a complete historical count is needed.
     ///
+    /// ## v2 → v3
+    /// Settlement receipts are now stored per-settlement_id for replay detection
+    /// and cross-contract verification. No back-fill is needed — receipts are
+    /// only written for post-migration settlements. The v3 code also adds TTL
+    /// extension calls (`extend_ttl`) on persistent storage to prevent data
+    /// loss on `RecipientTotal`, `WalletWindow`, and `SettlementReceipt` keys.
+    ///
     /// ## Rollback
     /// Schema bumps are additive (new keys only, no existing key is removed or
     /// retyped).  Rolling back the WASM to v1 is safe: the v1 code simply
@@ -468,6 +542,44 @@ impl AnonymousTipping {
             .unwrap_or(0_u64)
     }
 
+    /// Claim a settlement receipt by settlement_id for cross-contract
+    /// verification and replay detection.
+    ///
+    /// Returns the receipt if the settlement_id exists, or an error if
+    /// the settlement was never created or has expired from storage.
+    ///
+    /// ## Replay detection
+    /// Backend consumers can call this function with a candidate
+    /// settlement_id. If the receipt exists and the recipient matches,
+    /// the settlement is authentic. If the receipt does not exist, the
+    /// event should be treated as a replay or invalid.
+    ///
+    /// ## Cross-contract verification
+    /// Other Soroban contracts can call this function to verify that a
+    /// settlement occurred before releasing funds or granting access.
+    pub fn claim_receipt(env: Env, settlement_id: u64) -> Result<SettlementReceipt, Error> {
+        env.storage()
+            .persistent()
+            .get::<_, SettlementReceipt>(&DataKey::SettlementReceipt(settlement_id))
+            .ok_or(Error::SettlementNotFound)
+    }
+
+    /// Verify that a specific settlement_id belongs to the given recipient.
+    /// This is a convenience wrapper around `claim_receipt` that additionally
+    /// checks the recipient field, returning `SettlementReceipt` on match
+    /// or an appropriate error otherwise.
+    pub fn verify_settlement(
+        env: Env,
+        settlement_id: u64,
+        expected_recipient: Address,
+    ) -> Result<SettlementReceipt, Error> {
+        let receipt = Self::claim_receipt(env, settlement_id)?;
+        if receipt.recipient != expected_recipient {
+            return Err(Error::RecipientMismatch);
+        }
+        Ok(receipt)
+    }
+
     fn require_owner(env: &Env, caller: &Address) -> Result<(), Error> {
         let owner = env
             .storage()
@@ -517,6 +629,11 @@ impl AnonymousTipping {
         env.storage()
             .persistent()
             .set(&DataKey::WalletWindow(wallet.clone()), &state);
+        env.storage().persistent().extend_ttl(
+            &DataKey::WalletWindow(wallet.clone()),
+            PERSISTENT_TTL_LEDGERS,
+            PERSISTENT_TTL_LEDGERS,
+        );
         Ok(())
     }
 }
@@ -525,3 +642,5 @@ impl AnonymousTipping {
 mod test;
 #[cfg(test)]
 mod tipping_adversarial;
+#[cfg(test)]
+mod tipping_fuzz;

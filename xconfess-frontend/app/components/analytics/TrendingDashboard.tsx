@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   AnalyticsData,
   DailyActivity,
@@ -12,7 +12,7 @@ import { ReactionChart } from "./ReactionChart";
 import { ActivityChart } from "./ActivityChart";
 import { MetricsOverview } from "./MetricsOverview";
 import { AnalyticsLoadingSkeleton } from "./LoadingState";
-import { TrendingUp, Calendar } from "lucide-react";
+import { TrendingUp, Calendar, Flame, Clock } from "lucide-react";
 
 type AnalyticsApiResponse = Partial<AnalyticsData> & {
   generatedAt?: string;
@@ -82,7 +82,7 @@ function normalizeDailyActivity(value: unknown): DailyActivity[] {
 
 function normalizeAnalyticsData(
   payload: unknown,
-  fallbackPeriod: "7days" | "30days",
+  fallbackPeriod: "24h" | "7days" | "30days" | "all",
 ): AnalyticsData {
   const source: AnalyticsApiResponse = isRecord(payload) ? payload : {};
   const trending = normalizeTrending(source.trending);
@@ -90,7 +90,9 @@ function normalizeAnalyticsData(
     source.reactionDistribution,
   );
   const dailyActivity = normalizeDailyActivity(source.dailyActivity);
-  const metrics = isRecord(source.totalMetrics) ? source.totalMetrics : {};
+  const metrics: Record<string, unknown> = isRecord(source.totalMetrics)
+    ? source.totalMetrics
+    : {};
 
   return {
     trending,
@@ -105,7 +107,10 @@ function normalizeAnalyticsData(
       totalUsers: asNumber(metrics.totalUsers),
     },
     period:
-      source.period === "30days" || source.period === "7days"
+      source.period === "24h" ||
+      source.period === "30days" ||
+      source.period === "7days" ||
+      source.period === "all"
         ? source.period
         : fallbackPeriod,
   };
@@ -114,25 +119,44 @@ function normalizeAnalyticsData(
 export const TrendingDashboard = () => {
   const [data, setData] = useState<AnalyticsData | null>(null);
   const [loading, setLoading] = useState(true);
-  const [period, setPeriod] = useState<'7days' | '30days'>('7days');
+  const [period, setPeriod] = useState<'24h' | '7days' | '30days' | 'all'>('24h');
   const [error, setError] = useState<string | null>(null);
   const [fetchedAt, setFetchedAt] = useState<number | null>(null);
+  const autoRefreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const STALE_MS = 1000 * 60 * 5; // 5 minutes
+  const AUTO_REFRESH_MS = 1000 * 60 * 5; // 5 minutes
+  const STALE_MS = 1000 * 60 * 5;
 
   const fetchAnalytics = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
-      const res = await fetch(`/api/analytics/trending?period=${period}`);
+      const res = await fetch(`/api/confessions/trending/top?window=${period === '24h' ? '24h' : period === '7days' ? '7d' : period === '30days' ? '30d' : 'all'}`);
 
-      if (!res.ok) throw new Error('Failed to fetch analytics');
+      if (!res.ok) throw new Error('Failed to fetch trending');
 
-      const rawAnalyticsData = await res.json();
-      const analyticsData = normalizeAnalyticsData(rawAnalyticsData, period);
+      const rawData = await res.json();
+      const trendingPayload =
+        isRecord(rawData) && Array.isArray(rawData.data) ? rawData.data : null;
+      const analyticsData = trendingPayload
+        ? {
+          trending: normalizeTrending(trendingPayload),
+          reactionDistribution: [],
+          dailyActivity: [],
+          totalMetrics: {
+            totalConfessions: trendingPayload.length,
+            totalReactions: normalizeTrending(trendingPayload).reduce(
+              (sum, item) => sum + item.reactionCount,
+              0,
+            ),
+            totalUsers: 0,
+          },
+          period,
+        }
+        : normalizeAnalyticsData(rawData, period);
+
       setData(analyticsData);
 
-      // Prefer backend-provided timestamp header or body field when available
       const headerDate =
         typeof res.headers?.get === "function"
           ? res.headers.get("x-generated-at")
@@ -140,17 +164,14 @@ export const TrendingDashboard = () => {
       if (headerDate) {
         const ts = Date.parse(headerDate);
         if (!isNaN(ts)) setFetchedAt(ts);
-      } else if (
-        isRecord(rawAnalyticsData) &&
-        typeof rawAnalyticsData.generatedAt === "string"
-      ) {
-        const ts = Date.parse(rawAnalyticsData.generatedAt);
+      } else if (isRecord(rawData) && typeof rawData.generatedAt === "string") {
+        const ts = Date.parse(rawData.generatedAt);
         if (!isNaN(ts)) setFetchedAt(ts);
       } else {
         setFetchedAt(Date.now());
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load analytics');
+      setError(err instanceof Error ? err.message : 'Failed to load trending');
     } finally {
       setLoading(false);
     }
@@ -160,8 +181,17 @@ export const TrendingDashboard = () => {
     fetchAnalytics();
   }, [fetchAnalytics]);
 
+  // Auto-refresh every 5 minutes
+  useEffect(() => {
+    autoRefreshRef.current = setInterval(() => {
+      fetchAnalytics();
+    }, AUTO_REFRESH_MS);
+    return () => {
+      if (autoRefreshRef.current) clearInterval(autoRefreshRef.current);
+    };
+  }, [fetchAnalytics]);
+
   const isStale = fetchedAt ? Date.now() - fetchedAt > STALE_MS : false;
-  const isInitialLoad = !data && loading;
   const showSkeleton = !data;
   const trending = data?.trending ?? [];
   const reactionDistribution = data?.reactionDistribution ?? [];
@@ -195,10 +225,20 @@ export const TrendingDashboard = () => {
           {/* Period Selector */}
           <div className="flex flex-wrap items-center gap-2 mt-4 md:mt-0">
             <Calendar className="w-5 h-5 text-gray-400" />
-            <div className="flex gap-2">
+            <div className="flex gap-1">
+              <button
+                onClick={() => setPeriod('24h')}
+                className={`px-3 py-2 rounded-lg font-medium transition-colors text-sm ${period === '24h'
+                    ? 'bg-purple-600 text-white'
+                    : 'bg-zinc-800 text-gray-400 hover:bg-zinc-700'
+                  }`}
+              >
+                <Clock className="w-3.5 h-3.5 inline mr-1" />
+                24h
+              </button>
               <button
                 onClick={() => setPeriod('7days')}
-                className={`px-4 py-2 rounded-lg font-medium transition-colors ${period === '7days'
+                className={`px-3 py-2 rounded-lg font-medium transition-colors text-sm ${period === '7days'
                     ? 'bg-purple-600 text-white'
                     : 'bg-zinc-800 text-gray-400 hover:bg-zinc-700'
                   }`}
@@ -207,19 +247,29 @@ export const TrendingDashboard = () => {
               </button>
               <button
                 onClick={() => setPeriod('30days')}
-                className={`px-4 py-2 rounded-lg font-medium transition-colors ${period === '30days'
+                className={`px-3 py-2 rounded-lg font-medium transition-colors text-sm ${period === '30days'
                     ? 'bg-purple-600 text-white'
                     : 'bg-zinc-800 text-gray-400 hover:bg-zinc-700'
                   }`}
               >
                 30 Days
               </button>
+              <button
+                onClick={() => setPeriod('all')}
+                className={`px-3 py-2 rounded-lg font-medium transition-colors text-sm ${period === 'all'
+                    ? 'bg-purple-600 text-white'
+                    : 'bg-zinc-800 text-gray-400 hover:bg-zinc-700'
+                  }`}
+              >
+                All Time
+              </button>
             </div>
             <button
               onClick={fetchAnalytics}
               disabled={loading}
-              className="px-4 py-2 rounded-lg bg-slate-800 text-slate-200 hover:bg-slate-700 disabled:opacity-50"
+              className="px-4 py-2 rounded-lg bg-slate-800 text-slate-200 hover:bg-slate-700 disabled:opacity-50 flex items-center gap-1"
             >
+              <Flame className="w-4 h-4 text-orange-400" />
               {loading ? 'Refreshing…' : 'Refresh'}
             </button>
           </div>
@@ -278,8 +328,15 @@ export const TrendingDashboard = () => {
         {/* Trending Confessions */}
         <div className="bg-zinc-900 rounded-xl p-6 border border-zinc-800 min-h-[220px]">
           <h2 className="text-2xl font-bold mb-6 flex items-center gap-2">
-            <TrendingUp className="w-6 h-6 text-yellow-500" />
+            <Flame className="w-7 h-7 text-orange-500" />
             Top Trending Confessions
+            <span className="text-sm font-normal text-zinc-500 ml-2">
+              {fetchedAt && (
+                <span className={isStale ? 'text-amber-400' : 'text-zinc-500'}>
+                  Auto-refreshes every 5 min
+                </span>
+              )}
+            </span>
           </h2>
 
           <div className="space-y-4">
@@ -316,7 +373,7 @@ export const TrendingDashboard = () => {
               </p>
               <p className="mx-auto mt-2 max-w-md text-sm text-gray-400">
                 Try a different time period, refresh the dashboard, or seed demo
-                data before a GrantFox walkthrough.
+                data before a product walkthrough.
               </p>
               <button
                 type="button"

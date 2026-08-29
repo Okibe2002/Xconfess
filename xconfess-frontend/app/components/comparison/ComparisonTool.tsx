@@ -1,15 +1,15 @@
 'use client';
 
 import { useSearchParams } from 'next/navigation';
-import { useEffect } from 'react';
+import { useEffect, Suspense } from 'react';
 import { useComparison } from '@/app/lib/api/comparison';
 import { useComparisonStore } from '@/app/lib/store/comparisonStore';
 import { ComparisonTable } from './ComparisonTable';
 import { Button } from '@/app/components/ui/button';
-import { Share2, ArrowClockwise } from 'lucide-react';
+import { Share2, RefreshCw } from 'lucide-react';
 import { useGlobalToast } from '@/app/components/common/Toast';
 
-export function ComparisonTool() {
+function ComparisonToolContent() {
   const searchParams = useSearchParams();
   const idsParam = searchParams.get('ids');
   const itemIds = idsParam ? idsParam.split(',').filter(Boolean) : [];
@@ -48,7 +48,7 @@ export function ComparisonTool() {
           </Button>
           {error && (
             <Button variant="outline" onClick={() => void refetch()}>
-              <ArrowClockwise className="h-4 w-4 mr-2" />
+              <RefreshCw className="h-4 w-4 mr-2" />
               Retry
             </Button>
           )}
@@ -95,5 +95,20 @@ export function ComparisonTool() {
         )}
       </div>
     </div>
+  );
+}
+
+export function ComparisonTool() {
+  return (
+    <Suspense
+      fallback={
+        <div className="rounded-3xl border border-zinc-800 bg-zinc-950 p-6 min-h-[320px] flex flex-col items-center justify-center gap-2">
+          <div className="h-5 w-5 animate-spin rounded-full border-2 border-zinc-700 border-t-amber-500" />
+          <p className="text-xs text-zinc-500">Initializing layout context...</p>
+        </div>
+      }
+    >
+      <ComparisonToolContent />
+    </Suspense>
   );
 }

@@ -23,16 +23,19 @@ import {
 } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { AdminGuard } from '../auth/admin.guard';
+import { StepUpGuard } from '../auth/guards/step-up.guard';
 import { AdminService } from './services/admin.service';
 import { ModerationService } from './services/moderation.service';
 import { ModerationTemplateService } from '../comment/moderation-template.service';
 import { ResolveReportDto } from './dto/resolve-report.dto';
 import { BanUserDto } from './dto/ban-user.dto';
+import { UpdateUserRoleDto } from './dto/update-user-role.dto';
 import { BulkResolveDto } from './dto/bulk-resolve.dto';
 import { ReportStatus, ReportType } from './entities/report.entity';
 import { AuditActionType } from '../audit-log/audit-log.entity';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { TemplateCategory } from '../comment/entities/moderation-note-template.entity';
+import { UserRole } from '../user/entities/user.entity';
 import { Request } from 'express';
 import { GetUser } from '../auth/get-user.decorator';
 import { RequestUser } from '../auth/interfaces/jwt-payload.interface';
@@ -134,7 +137,7 @@ export class AdminController {
 
   // Reports
   @Get('reports')
-  @ApiOperation({ summary: 'List reports with optional filters' })
+  @ApiOperation({ summary: 'List reports with optional filters and cursor pagination' })
   @ApiQuery({
     name: 'status',
     required: false,
@@ -159,14 +162,14 @@ export class AdminController {
     type: String,
     example: '2026-04-30',
   })
-  @ApiQuery({ name: 'limit', required: false, type: Number, example: 50 })
-  @ApiQuery({ name: 'offset', required: false, type: Number, example: 0 })
+  @ApiQuery({ name: 'limit', required: false, type: Number, example: 20 })
+  @ApiQuery({ name: 'cursor', required: false, type: String, description: 'Opaque cursor for cursor-based pagination' })
   @ApiResponse({
     status: 200,
     description: 'Paginated report list.',
     schema: {
       example: {
-        reports: [
+        data: [
           {
             id: 'abc-123',
             confessionId: 'def-456',
@@ -174,9 +177,9 @@ export class AdminController {
             type: 'spam',
           },
         ],
-        total: 1,
-        limit: 50,
-        offset: 0,
+        nextCursor: 'eyJpZCI6MTIzLCJjcmVhdGVkQXQiOiIyMDI0LTAxLTAxVDAwOjAwOjAwWiJ9',
+        hasMore: false,
+        limit: 20,
       },
     },
   })
@@ -186,25 +189,18 @@ export class AdminController {
     @Query('startDate') startDate?: string,
     @Query('endDate') endDate?: string,
     @Query('limit') limit?: string,
-    @Query('offset') offset?: string,
+    @Query('cursor') cursor?: string,
   ) {
     const start = startDate ? new Date(startDate) : undefined;
     const end = endDate ? new Date(endDate) : undefined;
-    const [reports, total] = await this.adminService.getReports(
+    return this.adminService.getReportsCursor(
       status,
       type,
       start,
       end,
-      parseInt(limit || '50', 10),
-      parseInt(offset || '0', 10),
+      parseInt(limit || '20', 10),
+      cursor,
     );
-
-    return {
-      reports,
-      total,
-      limit: parseInt(limit || '50', 10),
-      offset: parseInt(offset || '0', 10),
-    };
   }
 
   @Get('reports/stats')
@@ -308,10 +304,11 @@ export class AdminController {
       req,
     );
   }
-
   // Confessions
   @Delete('confessions/:id')
+  @UseGuards(StepUpGuard)
   @HttpCode(HttpStatus.OK)
+  @UseGuards(StepUpGuard)
   @ApiOperation({ summary: 'Admin-delete a confession' })
   @ApiParam({ name: 'id', description: 'Confession UUID' })
   @ApiBody({ schema: { example: { reason: 'Violates community standards.' } } })
@@ -319,6 +316,10 @@ export class AdminController {
     status: 200,
     description: 'Confession deleted.',
     schema: { example: { message: 'Confession deleted successfully' } },
+  })
+  @ApiResponse({
+    status: 403,
+    description: 'Missing or expired step-up proof.',
   })
   async deleteConfession(
     @Param('id') id: string,
@@ -336,7 +337,16 @@ export class AdminController {
   }
 
   @Patch('confessions/:id/hide')
+  @UseGuards(StepUpGuard)
   @HttpCode(HttpStatus.OK)
+  @UseGuards(StepUpGuard)
+  @ApiOperation({ summary: 'Hide a confession from public view (admin only)' })
+  @ApiParam({ name: 'id', description: 'Confession UUID' })
+  @ApiResponse({ status: 200, description: 'Confession hidden.' })
+  @ApiResponse({
+    status: 403,
+    description: 'Missing or expired step-up proof.',
+  })
   async hideConfession(
     @Param('id') id: string,
     @Body() body: { reason?: string },
@@ -353,6 +363,9 @@ export class AdminController {
 
   @Patch('confessions/:id/unhide')
   @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Unhide a confession (admin only)' })
+  @ApiParam({ name: 'id', description: 'Confession UUID' })
+  @ApiResponse({ status: 200, description: 'Confession unhidden.' })
   async unhideConfession(
     @Param('id') id: string,
     @GetUser('id') adminId: number,
@@ -363,34 +376,35 @@ export class AdminController {
 
   // Users
   @Get('users/search')
-  @ApiOperation({ summary: 'Search users by username or email fragment' })
+  @ApiOperation({ summary: 'Search users by username with cursor pagination' })
   @ApiQuery({ name: 'q', description: 'Search query', example: 'alice' })
-  @ApiQuery({ name: 'limit', required: false, type: Number, example: 50 })
-  @ApiQuery({ name: 'offset', required: false, type: Number, example: 0 })
+  @ApiQuery({ name: 'limit', required: false, type: Number, example: 20 })
+  @ApiQuery({ name: 'cursor', required: false, type: String, description: 'Opaque cursor for cursor-based pagination' })
   @ApiResponse({
     status: 200,
-    description: 'Matching users.',
+    description: 'Matching users with cursor pagination.',
     schema: {
       example: {
-        users: [{ id: 1, username: 'alice_42', role: 'user' }],
-        total: 1,
+        data: [{ id: 1, username: 'alice_42', role: 'user' }],
+        nextCursor: null,
+        hasMore: false,
+        limit: 20,
       },
     },
   })
   async searchUsers(
     @Query('q') query: string,
     @Query('limit') limit?: string,
-    @Query('offset') offset?: string,
+    @Query('cursor') cursor?: string,
   ) {
     if (!query) {
-      return { users: [], total: 0 };
+      return { data: [], nextCursor: null, hasMore: false, limit: 20 };
     }
-    const [users, total] = await this.adminService.searchUsers(
+    return this.adminService.searchUsersCursor(
       query,
-      parseInt(limit || '50', 10),
-      parseInt(offset || '0', 10),
+      parseInt(limit || '20', 10),
+      cursor,
     );
-    return { users, total };
   }
 
   @Get('users/:id/history')
@@ -398,12 +412,60 @@ export class AdminController {
     return this.adminService.getUserHistory(parseInt(id, 10));
   }
 
-  @Patch('users/:id/ban')
+  @Post('users/unlock-account')
   @HttpCode(HttpStatus.OK)
+  @UseGuards(StepUpGuard)
+  @ApiOperation({ summary: 'Unlock a locked account by email' })
+  @ApiBody({ schema: { example: { email: 'user@example.com' } } })
+  @ApiResponse({ status: 200, description: 'Account unlocked.' })
+  async unlockAccount(@Body('email') email: string) {
+    await this.adminService.unlockAccount(email);
+    return { message: `Account unlocked for ${email}` };
+  }
+
+  @Patch('users/:id/role')
+  @UseGuards(StepUpGuard)
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(StepUpGuard)
+  @ApiOperation({ summary: 'Change a user role' })
+  @ApiParam({ name: 'id', description: 'User numeric ID' })
+  @ApiBody({ schema: { example: { role: UserRole.MODERATOR } } })
+  @ApiResponse({ status: 200, description: 'User role updated.' })
+  @ApiResponse({
+    status: 403,
+    description: 'Missing or expired step-up proof.',
+  })
+  async updateUserRole(
+    @Param('id') id: string,
+    @Body() dto: UpdateUserRoleDto,
+    @GetUser('id') adminId: number,
+    @Req() req: AuthedRequest,
+  ) {
+    return this.adminService.updateUserRole(
+      parseInt(id, 10),
+      dto.role,
+      adminId,
+      (dto as any).reason || null,
+      req,
+    );
+  }
+
+  @Patch('users/:id/ban')
+  @UseGuards(StepUpGuard)
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(StepUpGuard)
   @ApiOperation({ summary: 'Ban a user account' })
   @ApiParam({ name: 'id', description: 'User numeric ID' })
-  @ApiBody({ schema: { example: { reason: 'Repeated policy violations.' } } })
+  @ApiBody({
+    schema: {
+      example: { reason: 'Repeated policy violations.', durationDays: 30 },
+    },
+  })
   @ApiResponse({ status: 200, description: 'User banned.' })
+  @ApiResponse({
+    status: 403,
+    description: 'Missing or expired step-up proof.',
+  })
   async banUser(
     @Param('id') id: string,
     @Body() dto: BanUserDto,
@@ -415,6 +477,7 @@ export class AdminController {
       adminId,
       dto.reason || null,
       req,
+      dto.durationDays ?? null,
     );
   }
 
@@ -460,6 +523,7 @@ export class AdminController {
   }
 
   @Delete('templates/:id')
+  @UseGuards(StepUpGuard)
   @HttpCode(HttpStatus.NO_CONTENT)
   async deleteTemplate(@Param('id') id: string) {
     await this.moderationTemplateService.delete(parseInt(id, 10));
@@ -482,7 +546,7 @@ export class AdminController {
         horizonUrl: 'https://horizon-testnet.stellar.org',
         sorobanRpcUrl: 'https://soroban-rpc-testnet.stellar.org',
         contractIds: {
-          confessionAnchor: 'CBFR2MDZBQPTNBIJCT32MTDDQLW2AQNDWNO777F3QT6ANYKTHETQZWD3',
+          confessionAnchor: 'CB5XMDHT66EISB4WXM4YGNDHYRMZDX42TOHZEAENIUTSSMRFHJSFRNHB',
           reputationBadges: null,
           tippingSystem: null,
         },
@@ -512,7 +576,6 @@ export class AdminController {
   ) {
     return this.adminService.lookupAnchorAndTip({ txHash, confessionId });
   }
-
   // Analytics
   @Get('analytics')
   @ApiOperation({ summary: 'Get platform analytics (optionally date-bounded)' })
@@ -558,6 +621,11 @@ export class AdminController {
     description: 'Filter by admin user ID',
   })
   @ApiQuery({
+    name: 'actor',
+    required: false,
+    description: 'Filter by actor username, label, or ID',
+  })
+  @ApiQuery({
     name: 'action',
     required: false,
     description: 'Filter by action type',
@@ -567,6 +635,17 @@ export class AdminController {
     required: false,
     description: 'Filter by entity type (e.g. confession, user)',
   })
+  @ApiQuery({
+    name: 'search',
+    required: false,
+    description: 'Full-text keyword search across audit entries',
+  })
+  @ApiQuery({
+    name: 'sortBy',
+    required: false,
+    enum: ['createdAt', 'actor', 'action', 'target'],
+  })
+  @ApiQuery({ name: 'sortOrder', required: false, enum: ['ASC', 'DESC'] })
   @ApiQuery({ name: 'limit', required: false, type: Number, example: 100 })
   @ApiQuery({ name: 'offset', required: false, type: Number, example: 0 })
   @ApiResponse({
@@ -590,10 +669,14 @@ export class AdminController {
   })
   async getAuditLogs(
     @Query('adminId') adminId?: string,
+    @Query('actor') actor?: string,
     @Query('action') action?: string,
     @Query('entityType') entityType?: string,
     @Query('entityId') entityId?: string,
     @Query('requestId') requestId?: string,
+    @Query('search') search?: string,
+    @Query('sortBy') sortBy?: 'createdAt' | 'actor' | 'action' | 'target',
+    @Query('sortOrder') sortOrder?: 'ASC' | 'DESC',
     @Query('startDate') startDate?: string,
     @Query('endDate') endDate?: string,
     @Query('limit') limit?: string,
@@ -601,10 +684,14 @@ export class AdminController {
   ) {
     const result = await this.auditLogService.findAll({
       userId: adminId,
+      actor,
       actionType: parseAuditAction(action),
       entityType,
       entityId,
       requestId,
+      search,
+      sortBy,
+      sortOrder,
       startDate: startDate ? new Date(startDate) : undefined,
       endDate: endDate ? new Date(endDate) : undefined,
       limit: parseInt(limit || '100', 10),
@@ -631,22 +718,6 @@ export class AdminController {
   @ApiResponse({
     status: 200,
     description: 'Aggregated observability metrics for admin review.',
-    schema: {
-      example: {
-        audit: {
-          totalLogs: 128,
-          actionTypeCounts: [
-            { actionType: 'REPORT_RESOLVED', count: 56 },
-            { actionType: 'USER_BANNED', count: 12 },
-          ],
-        },
-        notifications: {
-          main: { active: 5, waiting: 10, failed: 2 },
-          dlq: { failed: 2, waiting: 0, delayed: 0 },
-        },
-        generatedAt: '2026-06-01T12:00:00.000Z',
-      },
-    },
   })
   async getObservability(
     @Query('startDate') startDate?: string,
@@ -654,62 +725,6 @@ export class AdminController {
   ) {
     const start = startDate ? new Date(startDate) : undefined;
     const end = endDate ? new Date(endDate) : undefined;
-
-    return this.adminService.getObservability(start, end);
-  }
-
-  // Audit Logs by requestId (dedicated endpoint for incident reviews)
-  @Get('audit-logs/by-request/:requestId')
-  async getAuditLogsByRequestId(
-    @Param('requestId') requestId: string,
-    @Query('limit') limit?: string,
-    @Query('offset') offset?: string,
-  ) {
-    const result = await this.auditLogService.findAll({
-      requestId,
-      limit: parseInt(limit || '100', 10),
-      offset: parseInt(offset || '0', 10),
-    });
-
-    return result;
-  }
-
-  // Audit Logs by entity (for reviewing actions on a specific target)
-  @Get('audit-logs/by-entity/:entityType/:entityId')
-  async getAuditLogsByEntity(
-    @Param('entityType') entityType: string,
-    @Param('entityId') entityId: string,
-    @Query('limit') limit?: string,
-    @Query('offset') offset?: string,
-  ) {
-    const result = await this.auditLogService.findAll({
-      entityType,
-      entityId,
-      limit: parseInt(limit || '100', 10),
-      offset: parseInt(offset || '0', 10),
-    });
-
-    return result;
-  }
-
-  @Post('exports/audit')
-  @HttpCode(HttpStatus.ACCEPTED)
-  @ApiOperation({ summary: 'Record admin CSV export action for audit' })
-  async auditExport(
-    @Body() dto: ExportAuditDto,
-    @GetUser('id') adminId: number,
-    @Req() req: AuthedRequest,
-  ) {
-    // Non-blocking: fire-and-forget audit logging
-    void this.auditLogService
-      .logAdminCsvExport(String(adminId), {
-        label: dto.label,
-        requestId: dto.requestId || (req.headers['x-request-id'] as string | undefined) || null,
-        rowCount: dto.rowCount ?? null,
-        filters: dto.filters || null,
-      }, { requestId: (req.headers['x-request-id'] as string) || undefined })
-      .catch(() => undefined);
-
-    return { accepted: true };
+    return this.auditLogService.getObservabilityMetrics(start, end);
   }
 }

@@ -12,16 +12,19 @@ import { ConfessionService } from './confession.service';
 import { AnonymousConfession } from './entities/confession.entity';
 import { Tag } from './entities/tag.entity';
 import { ConfessionTag } from './entities/confession-tag.entity';
+import { ConfessionIdempotencyRecord } from './entities/confession-idempotency-record.entity';
 import { AnonymousConfessionRepository } from './repository/confession.repository';
 import { ConfessionViewCacheService } from './confession-view-cache.service';
 import { TagService } from './tag.service';
 import { ConfessionSchedulerService } from './confession-scheduler.service';
+import { ConfessionIdempotencyService } from './confession-idempotency.service';
 import { ReactionModule } from '../reaction/reaction.module';
 import { AnonymousContextMiddleware } from '../middleware/anonymous-context.middleware';
 import { ModerationModule } from '../moderation/moderation.module';
 import { UserModule } from '../user/user.module';
 import { StellarModule } from '../stellar/stellar.module';
 import { SearchDiscoveryModule } from '../search-discovery/search-discovery.module';
+import { AnomalyDetectionModule } from '../anomaly/anomaly-detection.module';
 // In-memory mock Redis for development without Redis server
 const REDIS_TOKEN = 'default_IORedisModuleConnectionToken';
 class MockRedis {
@@ -61,13 +64,14 @@ class MockRedis {
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([AnonymousConfession, Tag, ConfessionTag]),
+    TypeOrmModule.forFeature([AnonymousConfession, Tag, ConfessionTag, ConfessionIdempotencyRecord]),
 
     forwardRef(() => ReactionModule),
     ModerationModule,
     forwardRef(() => UserModule),
     StellarModule,
     SearchDiscoveryModule,
+    AnomalyDetectionModule,
   ],
   controllers: [ConfessionController],
   providers: [
@@ -76,6 +80,7 @@ class MockRedis {
     ConfessionViewCacheService,
     TagService,
     ConfessionSchedulerService,
+    ConfessionIdempotencyService,
     { provide: 'VIEW_CACHE_EXPIRY', useValue: 60 * 60 },
     // Mock Redis provider for development without Redis server
     { provide: REDIS_TOKEN, useValue: new MockRedis() },
@@ -84,6 +89,7 @@ class MockRedis {
     AnonymousConfessionRepository,
     ConfessionService,
     ConfessionSchedulerService,
+    ConfessionIdempotencyService,
   ],
 })
 export class ConfessionModule implements NestModule {

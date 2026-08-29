@@ -1,5 +1,5 @@
 import { ExecutionContext, UnauthorizedException } from '@nestjs/common';
-import { JwtService } from '@nestjs/jwt';
+import { JwtService, TokenExpiredError } from '@nestjs/jwt';
 import { Server, Socket } from 'socket.io';
 import { WsJwtGuard } from '../../auth/guards/ws-jwt.guard';
 import { WebSocketLogger } from '../../websocket/websocket.logger';
@@ -40,7 +40,12 @@ describe('Notification websocket auth regression coverage', () => {
     const notificationService = {
       markAsRead: jest.fn(),
       markAllAsRead: jest.fn(),
-      getUserNotifications: jest.fn(),
+      getUserNotifications: jest.fn().mockResolvedValue({
+        notifications: [],
+        total: 0,
+        unreadCount: 0,
+      }),
+      shouldDeliverRealtime: jest.fn().mockResolvedValue(true),
     };
     const configService = {
       get: jest.fn((_key: string, fallback: unknown) => fallback),
@@ -54,6 +59,7 @@ describe('Notification websocket auth regression coverage', () => {
       gateway: new NotificationGateway(
         notificationService as any,
         configService as any,
+        { verifyAsync: jest.fn() } as any,
         wsLogger as unknown as WebSocketLogger,
       ),
       wsLogger,
@@ -197,6 +203,31 @@ describe('Notification websocket auth regression coverage', () => {
     });
   });
 
+  it('emits unread sync on connection for reconnect-safe notification loading', async () => {
+    const { gateway } = createGateway();
+    const client = createSocket({
+      data: { userId: 'user-1' },
+    });
+    gateway.notificationService.getUserNotifications = jest.fn().mockResolvedValue({
+      notifications: [{ id: 'missed-1' }],
+      total: 1,
+      unreadCount: 1,
+    });
+
+    gateway.handleConnection(client);
+    await Promise.resolve();
+
+    expect(gateway.notificationService.getUserNotifications).toHaveBeenCalledWith(
+      'user-1',
+      { page: 1, limit: 20, unreadOnly: true },
+    );
+    expect(client.emit).toHaveBeenCalledWith('notifications:sync', {
+      notifications: [{ id: 'missed-1' }],
+      unreadCount: 1,
+      timestamp: expect.any(String),
+    });
+  });
+
   it('rejects private notification room subscriptions for another user', () => {
     const { gateway, wsLogger } = createGateway();
     const client = createSocket({
@@ -255,5 +286,83 @@ describe('Notification websocket auth regression coverage', () => {
     expect(gateway.server.to).toHaveBeenCalledWith('user:user-1');
     expect(roomEmitter.emit).toHaveBeenCalledWith('new-notification', { id: 'notif-1' });
     expect(roomEmitter.emit).toHaveBeenCalledWith('unread-count', { count: 3 });
+  });
+
+  // ─── Auth telemetry: correlation IDs and reason codes ──────────────
+
+  it('rejects notification sockets with an expired token using EXPIRED_TOKEN reason code', async () => {
+    const client = createSocket({
+      handshake: {
+        auth: { token: 'expired-token' },
+        headers: {},
+      } as any,
+    });
+    const guard = createGuard({
+      verifyAsync: jest
+        .fn()
+        .mockRejectedValue(
+          new TokenExpiredError('jwt expired', new Date('2024-01-01')),
+        ),
+    });
+
+    let error: UnauthorizedException | undefined;
+    try {
+      await guard.canActivate(createWsContext(client));
+    } catch (e) {
+      error = e as UnauthorizedException;
+    }
+
+    expect(error).toBeDefined();
+    expect(error!.getResponse()).toMatchObject({
+      reasonCode: 'EXPIRED_TOKEN',
+    });
+  });
+
+  it('includes a correlationId and reasonCode in auth failure responses', async () => {
+    const client = createSocket();
+    const guard = createGuard({
+      verifyAsync: jest.fn(),
+    });
+
+    let error: UnauthorizedException | undefined;
+    try {
+      await guard.canActivate(createWsContext(client));
+    } catch (e) {
+      error = e as UnauthorizedException;
+    }
+
+    expect(error).toBeDefined();
+    const response = error!.getResponse() as Record<string, unknown>;
+    expect(response).toMatchObject({
+      reasonCode: 'NO_TOKEN_PROVIDED',
+    });
+    expect(response).toHaveProperty('correlationId');
+    expect(typeof response.correlationId).toBe('string');
+  });
+
+  it('redacts sensitive handshake headers after token extraction', async () => {
+    const client = createSocket({
+      handshake: {
+        auth: {},
+        headers: {
+          authorization: 'Bearer super-secret-jwt',
+          cookie: 'token=super-secret-cookie; foo=bar',
+        },
+      } as any,
+    });
+
+    // Token should be extracted from Authorization header
+    const guard = createGuard({
+      verifyAsync: jest.fn().mockRejectedValue(new Error('jwt malformed')),
+    });
+
+    await expect(guard.canActivate(createWsContext(client))).rejects.toThrow(
+      UnauthorizedException,
+    );
+
+    // After extraction, the raw values should be scrubbed
+    const headers = client.handshake?.headers as Record<string, string>;
+    expect(headers['authorization']).not.toContain('super-secret-jwt');
+    expect(headers['cookie']).not.toContain('super-secret-cookie');
   });
 });

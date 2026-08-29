@@ -1,8 +1,10 @@
 import apiClient from './client';
+import { stepUpHeader } from './stepUp';
 import type {
   FailedJobsResponse,
   FailedJobsFilter,
   ReplayJobResponse,
+  BulkReplayResponse,
 } from '../types/notification-jobs';
 
 export interface Report {
@@ -12,6 +14,8 @@ export interface Report {
     id: string;
     message: string;
     created_at: string;
+    isDeleted?: boolean;
+    isHidden?: boolean;
   };
   reporterId: number | null;
   reporter?: {
@@ -34,7 +38,7 @@ export interface Report {
 
 export interface AuditLog {
   id: string;
-  adminId: number;
+  adminId: number | null;
   admin?: {
     id: number;
     username: string;
@@ -46,16 +50,41 @@ export interface AuditLog {
   notes: string | null;
   ipAddress: string | null;
   userAgent: string | null;
+  requestId: string | null;
   createdAt: string;
 }
+
+export type AdminUserRole = 'user' | 'moderator' | 'admin';
 
 export interface User {
   id: number;
   username: string;
+  role: AdminUserRole;
   isAdmin: boolean;
   is_active: boolean;
+  confessionCount?: number;
+  reportsReceived?: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface UserHistoryResponse {
+  user: User;
+  summary?: {
+    confessionCount: number;
+    reportsFiled: number;
+    reportsReceived: number;
+  };
+  confessions: Array<Record<string, any>>;
+  reports: Array<Record<string, any>>;
+  activityTimeline?: Array<{
+    id: string;
+    type: string;
+    label: string;
+    createdAt: string;
+    summary?: string;
+  }>;
+  note?: string;
 }
 
 export interface Analytics {
@@ -107,7 +136,23 @@ export interface ReportStats {
   resolvedTodayCount: number;
 }
 
+export interface SystemHealthResponse {
+  status: 'ok' | 'error';
+  details?: Record<string, { status: string; [key: string]: any }>;
+  error?: string;
+}
+
 export const adminApi = {
+  getSystemHealth: async (): Promise<SystemHealthResponse> => {
+    const response = await apiClient.get('/api/health/ready');
+    return response.data;
+  },
+
+  requestStepUp: async (payload: { password?: string; totpToken?: string }) => {
+    const response = await apiClient.post('/api/auth/step-up', payload);
+    return response.data as { stepUpToken: string; expiresIn: number };
+  },
+
   // Reports
   getReports: async (params?: {
     status?: string;
@@ -154,18 +199,23 @@ export const adminApi = {
     return response.data as ReportStats;
   },
 
-  // Confessions
-  deleteConfession: async (id: string, reason?: string) => {
+
+  // Destructive actions require a recent step-up proof (see requestStepUp).
+  deleteConfession: async (id: string, reason?: string, stepUpToken?: string) => {
     const response = await apiClient.delete(`/api/admin/confessions/${id}`, {
       data: { reason },
+      headers: stepUpHeader(stepUpToken),
     });
     return response.data;
   },
 
-  hideConfession: async (id: string, reason?: string) => {
-    const response = await apiClient.patch(`/api/admin/confessions/${id}/hide`, {
-      reason,
-    });
+  hideConfession: async (id: string, reason?: string, stepUpToken?: string) => {
+    const response = await apiClient.patch(
+      `/api/admin/confessions/${id}/hide`,
+      { reason },
+      { headers: stepUpHeader(stepUpToken) },
+    );
+
     return response.data;
   },
 
@@ -175,22 +225,49 @@ export const adminApi = {
   },
 
   // Users
-  searchUsers: async (query: string, limit = 50, offset = 0) => {
+  searchUsers: async (
+    query: string,
+    limit = 50,
+    offset = 0,
+    sortBy: 'createdAt' | 'username' | 'role' | 'status' = 'createdAt',
+    sortOrder: 'ASC' | 'DESC' = 'DESC',
+  ) => {
     const response = await apiClient.get('/api/admin/users/search', {
-      params: { q: query, limit, offset },
+      params: { q: query || undefined, limit, offset, sortBy, sortOrder },
     });
     return response.data;
   },
 
-  getUserHistory: async (id: string) => {
+  getUserHistory: async (id: string): Promise<UserHistoryResponse> => {
     const response = await apiClient.get(`/api/admin/users/${id}/history`);
     return response.data;
   },
 
-  banUser: async (id: string, reason?: string) => {
-    const response = await apiClient.patch(`/api/admin/users/${id}/ban`, {
-      reason,
-    });
+  updateUserRole: async (
+    id: string,
+    role: AdminUserRole,
+    stepUpToken?: string,
+  ) => {
+    const response = await apiClient.patch(
+      `/api/admin/users/${id}/role`,
+      { role },
+      { headers: stepUpHeader(stepUpToken) },
+    );
+    return response.data;
+  },
+
+  banUser: async (
+    id: string,
+    reason?: string,
+    durationDays?: number | null,
+    stepUpToken?: string,
+  ) => {
+    const response = await apiClient.patch(
+      `/api/admin/users/${id}/ban`,
+      { reason, durationDays },
+      { headers: stepUpHeader(stepUpToken) },
+    );
+
     return response.data;
   },
 
@@ -221,6 +298,10 @@ export const adminApi = {
     entityType?: string;
     entityId?: string;
     requestId?: string;
+    actor?: string;
+    search?: string;
+    sortBy?: 'createdAt' | 'actor' | 'action' | 'target';
+    sortOrder?: 'ASC' | 'DESC';
     startDate?: string;
     endDate?: string;
     limit?: number;
@@ -259,5 +340,34 @@ export const adminApi = {
       reason,
     });
     return response.data;
+  },
+
+  bulkReplayJobs: async (jobIds: string[]): Promise<BulkReplayResponse> => {
+    const response = await apiClient.post('/api/admin/dlq/replay', { jobIds });
+    return response.data;
+  },
+
+  exportDlqCsv: async (filter?: FailedJobsFilter): Promise<void> => {
+    const params: Record<string, any> = {};
+    if (filter?.startDate) {
+      params.failedAfter = new Date(filter.startDate).toISOString();
+    }
+    if (filter?.endDate) {
+      params.failedBefore = new Date(filter.endDate).toISOString();
+    }
+
+    const response = await apiClient.get('/api/admin/dlq/export-csv', {
+      params,
+      responseType: 'blob',
+    });
+
+    const url = window.URL.createObjectURL(new Blob([response.data], { type: 'text/csv;charset=utf-8;' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', `dlq-jobs-${Date.now()}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    window.URL.revokeObjectURL(url);
   },
 };

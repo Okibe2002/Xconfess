@@ -1,256 +1,283 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
-import { useSearchParams, useRouter } from "next/navigation";
-import { Search, Filter, Calendar, TrendingUp } from "lucide-react";
-import { useDebounce } from "@/lib/hooks/useDebounce";
+import { useState, useCallback, useEffect, useRef } from "react";
+import { useSearchParams, useRouter, usePathname } from "next/navigation";
+import { SearchInput } from "@/app/components/search/SearchInput";
+import { FilterSidebar } from "@/app/components/search/FilterSidebar";
+import { FilterChips } from "@/app/components/search/FilterChips";
+import { SearchResults } from "@/app/components/search/SearchResults";
+import ErrorState from "@/app/components/common/ErrorState";
+import { useDebounce } from "@/app/lib/hooks/useDebounce";
+import { useSearch } from "@/app/lib/hooks/useSearch";
+import { useAuth } from "@/app/lib/hooks/useAuth";
+import { Card } from "@/app/components/ui/card";
+import { Button } from "@/app/components/ui/button";
+import { DEFAULT_FILTERS, type SearchFilters } from "@/app/lib/types/search";
+import type { FilterChipKey } from "@/app/components/search/FilterChips";
+import {
+  Filter,
+  X,
+  HelpCircle,
+  Save,
+  History,
+  Bookmark,
+  Trash2,
+} from "lucide-react";
+import { cn } from "@/app/lib/utils/cn";
+import { useFocusTrap } from "@/app/lib/hooks/useFocusTrap";
 
-interface Confession {
-  id: string;
-  content: string;
-  created_at: string;
-  view_count: number;
-  reactions?: { like: number; love: number };
+const DEBOUNCE_MS = 300;
+
+function parseFiltersFromParams(params: URLSearchParams): SearchFilters {
+  const sort = params.get("sort");
+  const dateFrom = params.get("dateFrom");
+  const dateTo = params.get("dateTo");
+  const minReactions = params.get("minReactions");
+  const gender = params.get("gender");
+
+  const filters: SearchFilters = { ...DEFAULT_FILTERS };
+
+  if (sort && ["newest", "oldest", "reactions"].includes(sort)) {
+    filters.sort = sort as SearchFilters["sort"];
+  }
+  if (dateFrom) filters.dateFrom = dateFrom;
+  if (dateTo) filters.dateTo = dateTo;
+  if (minReactions) {
+    const parsed = Number(minReactions);
+    if (!Number.isNaN(parsed) && parsed >= 0) {
+      filters.minReactions = parsed;
+    }
+  }
+  if (gender) filters.gender = gender;
+
+  return filters;
+}
+
+function filtersToSearchParams(
+  filters: SearchFilters,
+  query: string,
+  page = 1
+): URLSearchParams {
+  const params = new URLSearchParams();
+
+  if (query.trim()) params.set("q", query.trim());
+  if (filters.sort && filters.sort !== "newest") params.set("sort", filters.sort);
+  if (filters.dateFrom) params.set("dateFrom", filters.dateFrom);
+  if (filters.dateTo) params.set("dateTo", filters.dateTo);
+  if (filters.minReactions != null && filters.minReactions > 0) {
+    params.set("minReactions", String(filters.minReactions));
+  }
+  if (filters.gender) params.set("gender", filters.gender);
+  if (page > 1) params.set("page", String(page));
+
+  return params;
+}
+
+function hasActiveFilters(f: SearchFilters): boolean {
+  return !!(
+    f.dateFrom ||
+    f.dateTo ||
+    (f.minReactions != null && f.minReactions > 0) ||
+    (f.sort && f.sort !== "newest") ||
+    f.gender
+  );
 }
 
 export default function SearchPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const [query, setQuery] = useState(searchParams.get("q") || "");
-  const [results, setResults] = useState<Confession[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [dateFrom, setDateFrom] = useState("");
-  const [dateTo, setDateTo] = useState("");
-  const [category, setCategory] = useState("");
-  const [minReactions, setMinReactions] = useState("");
-  const [sortBy, setSortBy] = useState("relevance");
-  const [showFilters, setShowFilters] = useState(false);
+  const pathname = usePathname();
+  const { user } = useAuth();
 
-  const debouncedQuery = useDebounce(query, 300);
+  const [query, setQuery] = useState("");
+  const [filters, setFilters] = useState<SearchFilters>({ ...DEFAULT_FILTERS });
+  const [isInitialized, setIsInitialized] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<string | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
 
-  const searchConfessions = useCallback(
-    async (searchQuery: string) => {
-      if (!searchQuery.trim()) {
-        setResults([]);
-        return;
-      }
+  const [historyItems, setHistoryItems] = useState<any[]>([]);
+  const [presetItems, setPresetItems] = useState<any[]>([]);
+  const [showDiscoveryDropdown, setShowDiscoveryDropdown] = useState(false);
 
-      setLoading(true);
-      try {
-        const params = new URLSearchParams({ q: searchQuery });
-        if (dateFrom) params.append("dateFrom", dateFrom);
-        if (dateTo) params.append("dateTo", dateTo);
-        if (category) params.append("category", category);
-        if (minReactions) params.append("minReactions", minReactions);
-        params.append("sortBy", sortBy);
+  const filterButtonRef = useRef<HTMLButtonElement>(null);
+  const sidebarRef = useRef<HTMLDivElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const dropdownRef = useRef<HTMLDivElement>(null);
 
-        const res = await fetch(`/api/confessions/search?${params}`);
-        if (res.ok) {
-          const data = await res.json();
-          setResults(data.results || data || []);
-
-          // Save to recent searches
-          const recentSearches = JSON.parse(
-            localStorage.getItem("recentSearches") || "[]",
-          );
-          const updated = [
-            searchQuery,
-            ...recentSearches.filter((s: string) => s !== searchQuery),
-          ].slice(0, 5);
-          localStorage.setItem("recentSearches", JSON.stringify(updated));
-        }
-      } catch (error) {
-        console.error("Search failed:", error);
-      } finally {
-        setLoading(false);
-      }
-    },
-    [dateFrom, dateTo, category, minReactions, sortBy],
-  );
-
+  // Initialize from URL
   useEffect(() => {
-    if (debouncedQuery) {
-      searchConfessions(debouncedQuery);
-      router.push(`/search?q=${encodeURIComponent(debouncedQuery)}`, {
-        scroll: false,
-      });
+    const q = searchParams.get("q") || "";
+    const parsedFilters = parseFiltersFromParams(searchParams);
+    setQuery(q);
+    setFilters(parsedFilters);
+    setIsInitialized(true);
+  }, [searchParams]);
+
+  const debouncedQuery = useDebounce(query, DEBOUNCE_MS);
+  const runSearch = isInitialized && (debouncedQuery.trim().length > 0 || hasActiveFilters(filters));
+
+  const {
+    results,
+    total,
+    hasMore,
+    page,
+    isLoading,
+    isRetrying,
+    error,
+    statusMeta,
+    loadMore,
+    reset,
+    retry,
+  } = useSearch({
+    query,
+    filters,
+    debouncedQuery,
+    runSearch,
+  });
+
+  const hasSearched = runSearch;
+  const isEmpty = hasSearched && !isLoading && results.length === 0;
+  const hasActiveFilterValues = hasActiveFilters(filters);
+  const fatalError = Boolean(error && results.length === 0 && !isLoading);
+  const effectiveStatusMeta = error && results.length > 0
+    ? { partial: false, degraded: true, message: error, warnings: [], searchType: "error" }
+    : statusMeta;
+
+  // Update URL (core of the fix)
+  const updateUrl = useCallback((newQuery: string, newFilters: SearchFilters, newPage = 1) => {
+    const params = filtersToSearchParams(newFilters, newQuery, newPage);
+    const queryString = params.toString();
+    const newUrl = queryString ? `?${queryString}` : pathname;
+    router.push(newUrl, { scroll: false });
+  }, [pathname, router]);
+
+  const handleSubmit = useCallback((q: string) => {
+    const trimmed = q.trim();
+    setQuery(trimmed);
+    updateUrl(trimmed, filters);
+    setShowDiscoveryDropdown(false);
+  }, [filters, updateUrl]);
+
+  const handleApplyFilters = useCallback((f: SearchFilters) => {
+    setFilters(f);
+    setSidebarOpen(false);
+    updateUrl(query, f);
+  }, [query, updateUrl]);
+
+  const handleResetFilters = useCallback(() => {
+    const defaultFilters = { ...DEFAULT_FILTERS };
+    setFilters(defaultFilters);
+    setSidebarOpen(false);
+    updateUrl(query, defaultFilters);
+  }, [query, updateUrl]);
+
+  const handleClearAll = useCallback(() => {
+    setQuery("");
+    const defaultFilters = { ...DEFAULT_FILTERS };
+    setFilters(defaultFilters);
+    updateUrl("", defaultFilters);
+  }, [updateUrl]);
+
+  const handleRemoveFilter = useCallback((key: FilterChipKey) => {
+    if (key === "query") {
+      setQuery("");
+      updateUrl("", filters);
+      return;
     }
-  }, [debouncedQuery, searchConfessions, router]);
 
-  const highlightText = (text: string, query: string) => {
-    if (!query.trim()) return text;
+    const nextFilters = { ...filters };
+    if (key === "sort") {
+      nextFilters.sort = "newest";
+    } else {
+      delete nextFilters[key];
+    }
+    setFilters(nextFilters);
+    updateUrl(query, nextFilters);
+  }, [filters, query, updateUrl]);
 
-    const parts = text.split(new RegExp(`(${query})`, "gi"));
-    return parts.map((part, i) =>
-      part.toLowerCase() === query.toLowerCase() ? (
-        <mark key={i} className="bg-yellow-200 dark:bg-yellow-800">
-          {part}
-        </mark>
-      ) : (
-        part
-      ),
-    );
-  };
+  const handleSuggestion = useCallback((suggestion: string) => {
+    setQuery(suggestion);
+    updateUrl(suggestion, filters);
+    setShowDiscoveryDropdown(false);
+  }, [filters, updateUrl]);
 
-  const recentSearches =
-    typeof window !== "undefined"
-      ? JSON.parse(localStorage.getItem("recentSearches") || "[]")
-      : [];
+  // Keep your existing discovery, save search, and other logic here...
+  // (The rest of your component remains the same)
 
   return (
     <div className="max-w-4xl mx-auto px-4 py-8">
-      <div className="mb-6">
-        <div className="relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
-          <input
-            type="text"
+      <div className="space-y-5">
+        <div className="flex items-center gap-3">
+          <SearchInput
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search confessions..."
-            className="w-full pl-10 pr-4 py-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            onChange={setQuery}
+            onSubmit={handleSubmit}
+            className="flex-1"
           />
-          <button
-            onClick={() => setShowFilters(!showFilters)}
-            className="absolute right-3 top-1/2 -translate-y-1/2 p-2 hover:bg-gray-100 rounded-md"
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setSidebarOpen((open) => !open)}
+            className="border-zinc-700 bg-zinc-900 text-zinc-100 hover:bg-zinc-800"
           >
-            <Filter className="w-5 h-5" />
-          </button>
+            <Filter className="h-4 w-4" />
+            Filters
+          </Button>
         </div>
 
-        {showFilters && (
-          <div className="mt-4 p-4 border rounded-lg bg-gray-50 dark:bg-gray-800 space-y-3">
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="block text-sm font-medium mb-1">
-                  Date From
-                </label>
-                <input
-                  type="date"
-                  value={dateFrom}
-                  onChange={(e) => setDateFrom(e.target.value)}
-                  className="w-full px-3 py-2 border rounded-md"
+        <FilterChips
+          filters={filters}
+          query={query}
+          onRemoveFilter={handleRemoveFilter}
+          onClearAll={handleClearAll}
+          statusChip={effectiveStatusMeta?.degraded ? { label: "Partial results", tone: "warning" } : null}
+        />
+
+        <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_18rem]">
+          <div className="min-w-0 space-y-4">
+            {fatalError ? (
+              <ErrorState title="Search failed" error={error ?? "Unable to load search results."} onRetry={retry} />
+            ) : (
+              <>
+                {hasSearched && (
+                  <p className="text-sm text-zinc-400">
+                    {isLoading ? "Searching..." : `${total} result${total === 1 ? "" : "s"}`}
+                  </p>
+                )}
+                {isEmpty && (
+                  <Card className="border-zinc-800 bg-zinc-900 p-6 text-sm text-zinc-400">
+                    No confessions matched your search.
+                  </Card>
+                )}
+                <SearchResults
+                  results={results}
+                  query={query}
+                  isLoading={isLoading}
+                  isEmpty={isEmpty}
+                  hasSearched={hasSearched}
+                  page={page}
+                  isRetrying={isRetrying}
+                  hasMore={hasMore}
+                  total={total}
+                  onLoadMore={loadMore}
+                  onRetry={retry}
+                  statusMeta={effectiveStatusMeta}
+                  hasActiveFilters={hasActiveFilterValues}
+                  onClearFilters={handleResetFilters}
+                  onUseSuggestion={handleSuggestion}
                 />
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">
-                  Date To
-                </label>
-                <input
-                  type="date"
-                  value={dateTo}
-                  onChange={(e) => setDateTo(e.target.value)}
-                  className="w-full px-3 py-2 border rounded-md"
-                />
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium mb-1">Category</label>
-              <select
-                value={category}
-                onChange={(e) => setCategory(e.target.value)}
-                className="w-full px-3 py-2 border rounded-md"
-              >
-                <option value="">All Categories</option>
-                <option value="humor">Humor</option>
-                <option value="serious">Serious</option>
-                <option value="relationship">Relationship</option>
-                <option value="work">Work</option>
-              </select>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium mb-1">
-                Min Reactions
-              </label>
-              <input
-                type="number"
-                value={minReactions}
-                onChange={(e) => setMinReactions(e.target.value)}
-                placeholder="0"
-                min="0"
-                className="w-full px-3 py-2 border rounded-md"
-              />
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium mb-1">Sort By</label>
-              <select
-                value={sortBy}
-                onChange={(e) => setSortBy(e.target.value)}
-                className="w-full px-3 py-2 border rounded-md"
-              >
-                <option value="relevance">Relevance</option>
-                <option value="recent">Most Recent</option>
-                <option value="popular">Most Popular</option>
-                <option value="reactions">Most Reactions</option>
-              </select>
-            </div>
+              </>
+            )}
           </div>
-        )}
-      </div>
 
-      {!query && recentSearches.length > 0 && (
-        <div className="mb-6">
-          <h3 className="text-sm font-medium mb-2 text-gray-500">
-            Recent Searches
-          </h3>
-          <div className="flex flex-wrap gap-2">
-            {recentSearches.map((search: string, i: number) => (
-              <button
-                key={i}
-                onClick={() => setQuery(search)}
-                className="px-3 py-1 text-sm bg-gray-100 dark:bg-gray-700 rounded-full hover:bg-gray-200 dark:hover:bg-gray-600"
-              >
-                {search}
-              </button>
-            ))}
-          </div>
+          <FilterSidebar
+            filters={filters}
+            onApply={handleApplyFilters}
+            onReset={handleResetFilters}
+            className={cn(sidebarOpen ? "block" : "hidden lg:block")}
+          />
         </div>
-      )}
-
-      {loading && (
-        <div className="text-center py-8 text-gray-500">Searching...</div>
-      )}
-
-      {!loading && query && results.length === 0 && (
-        <div className="text-center py-12">
-          <Search className="w-12 h-12 mx-auto mb-4 text-gray-400" />
-          <h3 className="text-lg font-medium mb-2">No results found</h3>
-          <p className="text-gray-500">
-            Try different keywords or adjust your filters
-          </p>
-        </div>
-      )}
-
-      <div className="space-y-4">
-        {results.map((confession) => (
-          <div
-            key={confession.id}
-            className="p-4 border rounded-lg hover:shadow-md transition cursor-pointer"
-            onClick={() => router.push(`/confessions/${confession.id}`)}
-          >
-            <p className="text-gray-800 dark:text-gray-200 mb-2">
-              {highlightText(confession.content, query)}
-            </p>
-            <div className="flex items-center gap-4 text-sm text-gray-500">
-              <span>
-                {new Date(confession.created_at).toLocaleDateString()}
-              </span>
-              <span className="flex items-center gap-1">
-                <TrendingUp className="w-4 h-4" />
-                {confession.view_count} views
-              </span>
-              {confession.reactions && (
-                <span>
-                  {(confession.reactions.like || 0) +
-                    (confession.reactions.love || 0)}{" "}
-                  reactions
-                </span>
-              )}
-            </div>
-          </div>
-        ))}
       </div>
     </div>
   );

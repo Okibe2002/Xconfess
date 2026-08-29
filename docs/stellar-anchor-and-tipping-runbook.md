@@ -81,6 +81,15 @@ Operator checks for healthy flow:
   - Return canonical existing record where available.
   - Never double-credit tip totals.
 
+
+### Configuration Reference: SLA Thresholds
+The system identifies stuck transactions using `TIP_VERIFICATION_STALE_THRESHOLD_MINUTES`. 
+
+- **Default:** 30 minutes.
+- **Purpose:** Defines the duration after which a `pending` tip verification is escalated to `stale_pending` for operator visibility.
+- **Incident Triage:** If you receive alerts for stale tips, check this variable in your environment configuration. If your Stellar RPC/Horizon provider is experiencing known network-wide delays, you may need to temporarily increase this threshold to avoid false-positive escalations.
+
+
 ## Troubleshooting Playbooks
 
 ### Network Mismatch
@@ -262,6 +271,8 @@ grep '"requestId":"<value>"' app.log | grep '"txHash":"<value>"'
 ### Security invariant
 
 `requestId` is echoed from the incoming `x-request-id` header (or auto-generated). No secrets, private keys, or seed phrases are ever written to logs. Sender addresses are omitted when the tip is marked anonymous.
+
+This is enforced defensively, not just by convention: `src/utils/redact-secrets.ts` scrubs Stellar secret seeds and signed-XDR-shaped blobs from any string or structured payload before it reaches `AppLogger` or the global `AllExceptionsFilter`, so an unexpected error from the signing path cannot echo `STELLAR_SERVER_SECRET` (or a signed transaction envelope) into application logs or the audit log.
 
 ## Metrics & Observability (Reconciliation Lag)
 

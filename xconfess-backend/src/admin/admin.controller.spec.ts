@@ -4,8 +4,10 @@ import { AdminService } from './services/admin.service';
 import { ModerationService } from './services/moderation.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { AdminGuard } from '../auth/admin.guard';
+import { StepUpGuard } from '../auth/guards/step-up.guard';
 import { ModerationTemplateService } from '../comment/moderation-template.service';
 import { AuditLogService } from '../audit-log/audit-log.service';
+import { StellarDiagnosticsService } from './services/stellar-diagnostics.service';
 
 describe('AdminController', () => {
   let controller: AdminController;
@@ -14,6 +16,8 @@ describe('AdminController', () => {
 
   const mockAdminService = {
     getReports: jest.fn(),
+    getReportsCursor: jest.fn(),
+    getReportStats: jest.fn(),
     getReportById: jest.fn(),
     resolveReport: jest.fn(),
     dismissReport: jest.fn(),
@@ -22,7 +26,10 @@ describe('AdminController', () => {
     hideConfession: jest.fn(),
     unhideConfession: jest.fn(),
     searchUsers: jest.fn(),
+    searchUsersCursor: jest.fn(),
     getUserHistory: jest.fn(),
+    unlockAccount: jest.fn(),
+    updateUserRole: jest.fn(),
     banUser: jest.fn(),
     unbanUser: jest.fn(),
     getAnalytics: jest.fn(),
@@ -36,6 +43,11 @@ describe('AdminController', () => {
 
   const mockAuditLogService = {
     findAll: jest.fn(),
+    getObservabilityMetrics: jest.fn(),
+  };
+
+  const mockStellarDiagnosticsService = {
+    getDiagnostics: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -58,11 +70,17 @@ describe('AdminController', () => {
           provide: AuditLogService,
           useValue: mockAuditLogService,
         },
+        {
+          provide: StellarDiagnosticsService,
+          useValue: mockStellarDiagnosticsService,
+        },
       ],
     })
       .overrideGuard(JwtAuthGuard)
       .useValue({ canActivate: () => true })
       .overrideGuard(AdminGuard)
+      .useValue({ canActivate: () => true })
+      .overrideGuard(StepUpGuard)
       .useValue({ canActivate: () => true })
       .compile();
 
@@ -76,17 +94,25 @@ describe('AdminController', () => {
   });
 
   describe('getReports', () => {
-    it('should return reports with pagination', async () => {
-      const mockReports = [[{ id: '1' }], 1];
-      mockAdminService.getReports.mockResolvedValue(mockReports);
+    it('should return cursor-paginated reports', async () => {
+      const mockReports = {
+        data: [{ id: '1' }],
+        nextCursor: null,
+        hasMore: false,
+        limit: 20,
+      };
+      mockAdminService.getReportsCursor.mockResolvedValue(mockReports);
 
       const result = await controller.getReports();
-      expect(result).toEqual({
-        reports: [{ id: '1' }],
-        total: 1,
-        limit: 50,
-        offset: 0,
-      });
+      expect(result).toEqual(mockReports);
+      expect(mockAdminService.getReportsCursor).toHaveBeenCalledWith(
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        20,
+        undefined,
+      );
     });
   });
 
@@ -173,25 +199,57 @@ describe('AdminController', () => {
   });
 
   describe('users', () => {
-    it('searchUsers returns empty when q missing', async () => {
+    it('searchUsers lists users when q missing', async () => {
       const res = await controller.searchUsers('' as any);
-      expect(res).toEqual({ users: [], total: 0 });
+      expect(res).toEqual({
+        data: [],
+        nextCursor: null,
+        hasMore: false,
+        limit: 20,
+      });
+      expect(mockAdminService.searchUsersCursor).not.toHaveBeenCalled();
     });
 
     it('searchUsers calls service when q present', async () => {
-      mockAdminService.searchUsers.mockResolvedValue([[{ id: 1 }], 1]);
+      mockAdminService.searchUsersCursor.mockResolvedValue({
+        data: [{ id: 1 }],
+        nextCursor: null,
+        hasMore: false,
+        limit: 10,
+      });
       const res = await controller.searchUsers('abc', '10', '0');
-      expect(res.total).toBe(1);
+      expect(res.data).toHaveLength(1);
+      expect(mockAdminService.searchUsersCursor).toHaveBeenCalledWith(
+        'abc',
+        10,
+        '0',
+      );
     });
 
     it('ban/unban call service', async () => {
       mockAdminService.banUser.mockResolvedValue({ id: 2, is_active: false });
       mockAdminService.unbanUser.mockResolvedValue({ id: 2, is_active: true });
       const req = { user: { userId: '1' } } as any;
-      await controller.banUser('2', { reason: 'x' }, req);
-      await controller.unbanUser('2', req);
+      await controller.banUser('2', { reason: 'x' }, 1, req);
+      await controller.unbanUser('2', 1, req);
       expect(adminService.banUser).toHaveBeenCalled();
       expect(adminService.unbanUser).toHaveBeenCalled();
+    });
+
+    it('updateUserRole calls service', async () => {
+      mockAdminService.updateUserRole.mockResolvedValue({
+        id: 2,
+        role: 'moderator',
+      });
+      const req = { user: { userId: '1' } } as any;
+      await controller.updateUserRole('2', { role: 'moderator' as any }, 1, req);
+      expect(adminService.updateUserRole).toHaveBeenCalledWith(
+        2,
+        'moderator',
+        1,
+        null,
+        req,
+      );
     });
   });
 
@@ -225,12 +283,12 @@ describe('AdminController', () => {
         },
         generatedAt: '2026-06-01T00:00:00.000Z',
       };
-      mockAdminService.getObservability.mockResolvedValue(mockPayload);
+      mockAuditLogService.getObservabilityMetrics.mockResolvedValue(mockPayload);
 
       const res = await controller.getObservability('2026-05-01', '2026-05-31');
 
       expect(res).toEqual(mockPayload);
-      expect(mockAdminService.getObservability).toHaveBeenCalledWith(
+      expect(mockAuditLogService.getObservabilityMetrics).toHaveBeenCalledWith(
         new Date('2026-05-01'),
         new Date('2026-05-31'),
       );

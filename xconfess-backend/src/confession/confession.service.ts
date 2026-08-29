@@ -11,6 +11,7 @@ import {
   encodeCursor,
   CursorPaginatedResponseDto,
 } from '../common/pagination';
+import { Brackets } from 'typeorm';
 import { AnonymousConfessionRepository } from './repository/confession.repository';
 import { CreateConfessionDto } from './dto/create-confession.dto';
 import { GetConfessionsByTagDto } from './dto/get-confessions-by-tag.dto';
@@ -21,6 +22,8 @@ import sanitizeHtml from 'sanitize-html';
 import {
   encryptConfession,
   decryptConfession,
+  safeDecryptConfession,
+  assertEncryptedBeforeSave,
 } from '../utils/confession-encryption';
 import { ConfessionViewCacheService } from './confession-view-cache.service';
 import { Request } from 'express';
@@ -34,17 +37,21 @@ import { AnonymousUserService } from '../user/anonymous-user.service';
 import { EntityManager, Repository } from 'typeorm';
 import { AnonymousUser } from '../user/entities/anonymous-user.entity';
 import { AnonymousConfession } from './entities/confession.entity';
-import { AppLogger } from 'src/logger/logger.service';
-import { maskUserId } from 'src/utils/mask-user-id';
-import { EncryptionService } from 'src/encryption/encryption.service';
+import { AppLogger } from '../logger/logger.service';
+import { maskUserId } from '../utils/mask-user-id';
+import { EncryptionService } from '../encryption/encryption.service';
 import { ConfessionResponseDto } from './dto/confession-response.dto';
 import { StellarService } from '../stellar/stellar.service';
+import { ContractService } from '../stellar/contract.service';
 import { AnchorConfessionDto } from '../stellar/dto/anchor-confession.dto';
 import { CacheService, CACHE_TTL } from '../cache/cache.service';
 import { TagService } from './tag.service';
 import { ConfessionTag } from './entities/confession-tag.entity';
-import { toWindowBoundaries, TrendingWindow } from 'src/types/analytics.types';
+import { toWindowBoundaries, TrendingWindow } from '../types/analytics.types';
 import { GetUserConfessionsDto } from './dto/get-user-confessions.dto';
+import { mapToSlimConfession } from './utils/confession-mapper';
+import { AnomalyDetectionService } from '../anomaly/anomaly-detection.service';
+import { ConfessionIdempotencyService } from './confession-idempotency.service';
 
 @Injectable()
 export class ConfessionService {
@@ -58,9 +65,12 @@ export class ConfessionService {
     private readonly logger: AppLogger,
     private encryptionService: EncryptionService,
     private readonly stellarService: StellarService,
+    private readonly contractService: ContractService,
     private readonly cacheService: CacheService,
     private readonly tagService: TagService,
     private readonly configService: ConfigService,
+    private readonly anomalyDetection: AnomalyDetectionService,
+    private readonly idempotencyService: ConfessionIdempotencyService,
   ) {}
 
   private get aesKey(): string {
@@ -80,29 +90,61 @@ export class ConfessionService {
     const msg = this.sanitizeMessage(dto.message);
     if (!msg) throw new BadRequestException('Invalid confession content');
 
-    // Idempotency: return existing confession if key was already processed
+    // ── Idempotency check ─────────────────────────────────────────────────
     if (dto.idempotencyKey) {
-      const existing = await this.confessionRepo.findOne({
-        where: { idempotencyKey: dto.idempotencyKey },
+      const payloadHash = this.idempotencyService.computePayloadHash({
+        message: msg,
+        gender: dto.gender ?? null,
+        tags: dto.tags ?? null,
+        stellarTxHash: dto.stellarTxHash ?? null,
       });
-      if (existing) {
-        const decryptedMessage = decryptConfession(existing.message, this.aesKey);
-        const hasSamePayload =
-          msg === decryptedMessage &&
-          (dto.gender ?? null) === (existing.gender ?? null) &&
-          (dto.stellarTxHash ?? null) === (existing.stellarTxHash ?? null);
 
-        if (!hasSamePayload) {
-          throw new ConflictException(
-            'Idempotency key replay conflict: request body does not match original submission.',
-          );
+      const idempotencyResult = await this.idempotencyService.check(
+        dto.idempotencyKey,
+        payloadHash,
+      );
+
+      if (idempotencyResult.isReplay) {
+        // Return the canonical cached response without re-creating anything.
+        const cached = idempotencyResult.cachedResponse;
+        if (cached) {
+          cached.message = decryptConfession(cached.message, this.aesKey);
         }
-
-        existing.message = decryptedMessage;
-        return existing;
+        return cached;
       }
+
+      // First occurrence: run creation, then commit idempotency record.
+      let savedConfession: AnonymousConfession;
+      try {
+        savedConfession = await this.executeCreate(dto, msg, manager);
+      } catch (err) {
+        await this.idempotencyService.commitFailure(idempotencyResult.record);
+        throw err;
+      }
+
+      await this.idempotencyService.commitSuccess(
+        idempotencyResult.record,
+        savedConfession,
+        { id: savedConfession.id, message: msg },
+        201,
+      );
+
+      return savedConfession;
     }
 
+    // No idempotency key – run creation directly (legacy / optional path).
+    return this.executeCreate(dto, msg, manager);
+  }
+
+  /**
+   * Core confession creation logic, extracted so it can be called both from
+   * the idempotency-guarded path and the legacy (no-key) path.
+   */
+  private async executeCreate(
+    dto: CreateConfessionDto,
+    msg: string,
+    manager?: EntityManager,
+  ): Promise<AnonymousConfession> {
     try {
       // Step 0: Validate tags if provided
       let validatedTags: any[] = [];
@@ -123,6 +165,7 @@ export class ConfessionService {
 
       // Step 2: Encrypt and save the confession
       const encryptedMsg = encryptConfession(msg, this.aesKey);
+      assertEncryptedBeforeSave(encryptedMsg);
       const confessionRepo: Repository<AnonymousConfession> = manager
         ? manager.getRepository(AnonymousConfession)
         : (this.confessionRepo as unknown as Repository<AnonymousConfession>);
@@ -152,6 +195,7 @@ export class ConfessionService {
 
       const conf = confessionRepo.create({
         message: encryptedMsg,
+        keyVersion: 'v1',
         gender: dto.gender,
         anonymousUser,
         moderationScore: moderationResult.score,
@@ -194,7 +238,7 @@ export class ConfessionService {
         manager,
       );
 
-      // Step 4: Handle high-severity content
+      // Step 4: Handle high-severity content – only emit once per creation
       if (moderationResult.status === ModerationStatus.REJECTED) {
         this.eventEmitter.emit('moderation.high-severity', {
           confessionId: savedConfession.id,
@@ -203,7 +247,7 @@ export class ConfessionService {
         });
       }
 
-      // Step 5: Handle medium-severity content
+      // Step 5: Handle medium-severity content – only emit once per creation
       if (moderationResult.status === ModerationStatus.FLAGGED) {
         this.eventEmitter.emit('moderation.requires-review', {
           confessionId: savedConfession.id,
@@ -215,13 +259,19 @@ export class ConfessionService {
       return savedConfession;
     } catch (error) {
       if (error instanceof BadRequestException) throw error;
+      if (error instanceof ConflictException) throw error;
 
       if (dto.idempotencyKey && (error as any)?.code === '23505') {
+        // The idempotency_key UNIQUE constraint on anonymous_confessions fired
+        // while the records table approach was bypassed (legacy path).
         const existing = await this.confessionRepo.findOne({
           where: { idempotencyKey: dto.idempotencyKey },
         });
         if (existing) {
-          const decryptedMessage = decryptConfession(existing.message, this.aesKey);
+          const decryptedMessage = decryptConfession(
+            existing.message,
+            this.aesKey,
+          );
           const hasSamePayload =
             msg === decryptedMessage &&
             (dto.gender ?? null) === (existing.gender ?? null) &&
@@ -267,30 +317,50 @@ export class ConfessionService {
 
     const qb = this.confessionRepo
       .createQueryBuilder('confession')
-      .leftJoinAndSelect('confession.anonymousUser', 'anonymousUser')
-      .leftJoinAndSelect('anonymousUser.userLinks', 'userLinks')
-      .leftJoinAndSelect('userLinks.user', 'user')
+      .leftJoin('confession.anonymousUser', 'anonymousUser')
+      .leftJoin('anonymousUser.userLinks', 'userLinks')
+      .leftJoin('userLinks.user', 'user')
       .andWhere('confession.isDeleted = false')
       .andWhere('confession.isHidden = false')
       .andWhere('confession.moderationStatus IN (:...statuses)', {
         statuses: [ModerationStatus.APPROVED, ModerationStatus.PENDING],
       })
+      // Public feed / scheduling: never show drafts; only show scheduled
+      // posts once their publishAt has passed. (Previously unfiltered —
+      // draft/future-scheduled rows could leak into the public feed.)
+      .andWhere("confession.status != 'draft'")
       .andWhere(
-        "(anonymousUser.userLinks IS NULL OR anonymousUser.userLinks = '{}' OR user.privacy_settings IS NULL OR user.privacy_settings->>'isDiscoverable' = 'true' OR JSON_TYPE(user.privacy_settings, '$.isDiscoverable') IS NULL)",
+        "(confession.status != 'scheduled' OR confession.publishAt <= :now)",
+        { now: new Date() },
+      )
+      // Discoverability: exclude confessions whose author has explicitly
+      // opted out via privacy_settings.isDiscoverable = false. Rewritten
+      // from a MySQL-only JSON_TYPE(...) clause, which threw a Postgres
+      // syntax error on every request that joined a linked user row —
+      // the actual cause of the generic 500s referenced in this issue.
+      .andWhere(
+        new Brackets((sub) => {
+          sub
+            .where('userLinks.id IS NULL')
+            .orWhere('user.privacy_settings IS NULL')
+            .orWhere(
+              "user.privacy_settings->>'isDiscoverable' IS DISTINCT FROM 'false'",
+            );
+        }),
       )
       .leftJoinAndSelect('confession.reactions', 'reactions')
-      .leftJoinAndSelect('reactions.anonymousUser', 'reactionUser')
       .select([
         'confession.id',
         'confession.message',
         'confession.gender',
         'confession.created_at',
         'confession.view_count',
+        'confession.isAnchored',
+        'confession.stellarTxHash',
         'confession.moderationStatus',
         'reactions.id',
         'reactions.emoji',
         'reactions.createdAt',
-        'reactionUser.id',
       ]);
 
     if (dto.gender) {
@@ -331,10 +401,13 @@ export class ConfessionService {
     const hasMore = items.length > limit;
     const resultItems = hasMore ? items.slice(0, limit) : items;
 
-    const decryptedItems = resultItems.map((item) => ({
-      ...item,
-      message: decryptConfession(item.message, this.aesKey),
-    }));
+    const decryptedItems = resultItems.map((item) => {
+      const decrypted = {
+        ...item,
+        message: decryptConfession(item.message, this.aesKey),
+      };
+      return mapToSlimConfession(decrypted);
+    });
 
     let nextCursor: string | null = null;
     if (hasMore && decryptedItems.length > 0) {
@@ -372,6 +445,7 @@ export class ConfessionService {
         await this.aiModerationService.moderateContent(sanitized);
 
       dto.message = encryptConfession(sanitized, this.aesKey);
+      assertEncryptedBeforeSave(dto.message);
       await this.confessionRepo.update(id, {
         ...dto,
         moderationScore: moderationResult.score,
@@ -534,8 +608,16 @@ export class ConfessionService {
       sampled,
     });
 
+    const mappedConfessions = (result?.confessions || []).map((item) => {
+      const decrypted = {
+        ...item,
+        message: decryptConfession(item.message, this.aesKey),
+      };
+      return mapToSlimConfession(decrypted);
+    });
+
     return {
-      data: result?.confessions || [],
+      data: mappedConfessions,
       meta: {
         total: result?.total || 0,
         page: dto.page,
@@ -572,8 +654,16 @@ export class ConfessionService {
       sampled,
     });
 
+    const mappedConfessions = (result?.confessions || []).map((item) => {
+      const decrypted = {
+        ...item,
+        message: decryptConfession(item.message, this.aesKey),
+      };
+      return mapToSlimConfession(decrypted);
+    });
+
     return {
-      data: result?.confessions || [],
+      data: mappedConfessions,
       meta: {
         total: result?.total || 0,
         page: dto.page,
@@ -656,21 +746,69 @@ export class ConfessionService {
         }
         updated.message = decryptConfession(updated.message, this.aesKey);
       }
-      await this.cacheService.set(singleCacheKey, updated, CACHE_TTL.CONFESSION_SINGLE);
+      await this.cacheService.set(
+        singleCacheKey,
+        updated,
+        CACHE_TTL.CONFESSION_SINGLE,
+      );
       return updated;
     }
 
     conf.message = decryptConfession(conf.message, this.aesKey);
-    await this.cacheService.set(singleCacheKey, conf, CACHE_TTL.CONFESSION_SINGLE);
+    await this.cacheService.set(
+      singleCacheKey,
+      conf,
+      CACHE_TTL.CONFESSION_SINGLE,
+    );
     return conf;
   }
 
-  async getTrendingConfessions() {
-    // Standardize the trending window to 24 h with UTC-floored boundaries
-    // so edge-of-day records are counted consistently.
-    const { startAt, endAt } = toWindowBoundaries(TrendingWindow.DAY);
-    const confs = await this.confessionRepo.findTrending(10, startAt, endAt);
-    return { data: confs };
+  async getTrendingConfessions(window: string = '24h') {
+    let days: number;
+    switch (window) {
+      case '7d':
+        days = TrendingWindow.WEEK;
+        break;
+      case '30d':
+        days = TrendingWindow.MONTH;
+        break;
+      case 'all':
+        days = 365 * 10;
+        break;
+      default:
+        days = TrendingWindow.DAY;
+    }
+
+    const { startAt, endAt } = toWindowBoundaries(days);
+    const rawConfs = await this.confessionRepo.findTrending(20, startAt, endAt);
+
+    // Apply anomaly/bot detection adjustment to reduce bot-inflated scores
+    const confs = rawConfs as any[];
+    const adjusted = await Promise.all(
+      confs.map(async (item) => {
+        const adjustment = await this.anomalyDetection.getAdjustmentFactor(
+          item.id,
+        );
+        return { item, adjustment };
+      }),
+    );
+
+    // Sort by adjusted score: raw trending_score * anomaly adjustment
+    adjusted.sort((a, b) => {
+      const scoreA = Number(a.item.trending_score) || 0;
+      const scoreB = Number(b.item.trending_score) || 0;
+      return scoreB * b.adjustment - scoreA * a.adjustment;
+    });
+
+    const mapped = adjusted.map(({ item }) => {
+      const decrypted = {
+        ...item,
+        message: decryptConfession(item.message, this.aesKey),
+      };
+      return mapToSlimConfession(decrypted);
+    });
+
+    return { data: mapped, window };
   }
 
   async updateModerationStatus(
@@ -711,8 +849,8 @@ export class ConfessionService {
     const skip = (page - 1) * limit;
     const [data, total] = await this.confessionRepo.findAndCount({
       where: [
-        { requiresReview: true },
-        { moderationStatus: ModerationStatus.FLAGGED as any },
+        { requiresReview: true, isDeleted: false },
+        { moderationStatus: ModerationStatus.FLAGGED as any, isDeleted: false },
       ],
       order: { created_at: 'DESC' },
       skip,
@@ -863,6 +1001,7 @@ export class ConfessionService {
   async findAll(): Promise<ConfessionResponseDto[]> {
     try {
       const confessions = await this.confessionRepo.find({
+        where: { isDeleted: false },
         order: { created_at: 'DESC' },
       });
 
@@ -881,7 +1020,7 @@ export class ConfessionService {
   async findOne(id: string): Promise<ConfessionResponseDto> {
     try {
       const confession = await this.confessionRepo.findOne({
-        where: { id },
+        where: { id, isDeleted: false },
       });
 
       if (!confession) {
@@ -922,26 +1061,38 @@ export class ConfessionService {
     }
 
     // A stellarTxHash without isAnchored means a prior submission is pending
-    // on-chain. Return the existing pending state instead of starting new work.
+    // on-chain. If the same tx hash is provided, return the existing pending
+    // state (idempotent replay). If a different tx hash is provided, allow
+    // the update to enable safe retry after a stale/failed anchor.
     if (confession.stellarTxHash && !confession.isAnchored) {
-      this.logger.log({
-        event: 'anchor_replay',
-        confessionId: confession.id,
-        stellarTxHash: confession.stellarTxHash,
-      });
+      if (confession.stellarTxHash === dto.stellarTxHash) {
+        this.logger.log({
+          event: 'anchor_replay',
+          confessionId: confession.id,
+          stellarTxHash: confession.stellarTxHash,
+        });
 
-      return {
+        return {
+          confessionId: confession.id,
+          stellarTxHash: confession.stellarTxHash,
+          stellarHash: confession.stellarHash,
+          isAnchored: false,
+          anchorPending: true,
+          message:
+            'An anchor submission is already pending for this confession. Wait for it to confirm or fail before retrying.',
+          stellarExplorerUrl: this.stellarService.getExplorerUrl(
+            confession.stellarTxHash,
+          ),
+        };
+      }
+
+      // Different tx hash provided — this is a retry. Log and continue.
+      this.logger.log({
+        event: 'anchor_retry_replace',
         confessionId: confession.id,
-        stellarTxHash: confession.stellarTxHash,
-        stellarHash: confession.stellarHash,
-        isAnchored: false,
-        anchorPending: true,
-        message:
-          'An anchor submission is already pending for this confession. Wait for it to confirm or fail before retrying.',
-        stellarExplorerUrl: this.stellarService.getExplorerUrl(
-          confession.stellarTxHash,
-        ),
-      };
+        previousTxHash: confession.stellarTxHash,
+        newTxHash: dto.stellarTxHash,
+      });
     }
 
     if (!this.stellarService.isValidTxHash(dto.stellarTxHash)) {
@@ -975,9 +1126,7 @@ export class ConfessionService {
       throw error;
     }
 
-    await this.cacheService.del(
-      this.cacheService.buildKey('confession', id),
-    );
+    await this.cacheService.del(this.cacheService.buildKey('confession', id));
 
     const updated = await this.confessionRepo.findOne({ where: { id } });
     if (updated) {
@@ -1012,9 +1161,27 @@ export class ConfessionService {
       };
     }
 
-    const isVerified = await this.stellarService.verifyTransaction(
+    const txSucceeded = await this.stellarService.verifyTransaction(
       confession.stellarTxHash,
     );
+
+    // A successful transaction alone does not prove *this* confession was
+    // anchored — the reported tx hash could belong to an unrelated or stale
+    // submission. Confirm the contract's on-chain state actually holds the
+    // locally-computed hash before trusting the anchor.
+    const payloadMatches =
+      txSucceeded &&
+      !!confession.stellarHash &&
+      (await this.contractService.verifyConfession(confession.stellarHash)) !==
+        null;
+
+    if (txSucceeded && !payloadMatches) {
+      this.logger.warn(
+        `Anchor hash mismatch for confession ${confession.id}: transaction ${confession.stellarTxHash} succeeded on-chain but does not anchor the expected confession hash`,
+      );
+    }
+
+    const isVerified = payloadMatches;
 
     // Pending anchor confirmed on-chain: promote to fully anchored
     if (!confession.isAnchored && isVerified) {
@@ -1025,9 +1192,7 @@ export class ConfessionService {
       });
       confession.isAnchored = true;
       confession.anchoredAt = now;
-      await this.cacheService.del(
-        this.cacheService.buildKey('confession', id),
-      );
+      await this.cacheService.del(this.cacheService.buildKey('confession', id));
     }
 
     return {
@@ -1098,10 +1263,13 @@ export class ConfessionService {
     const { confessions, nextCursor, hasMore } =
       await this.confessionRepo.findByTag(tagName, page, limit, cursor);
 
-    const decryptedItems = confessions.map((item) => ({
-      ...item,
-      message: decryptConfession(item.message, this.aesKey),
-    }));
+    const decryptedItems = confessions.map((item) => {
+      const decrypted = {
+        ...item,
+        message: decryptConfession(item.message, this.aesKey),
+      };
+      return mapToSlimConfession(decrypted);
+    });
 
     const result = new CursorPaginatedResponseDto(
       decryptedItems,
