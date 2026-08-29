@@ -171,6 +171,15 @@ export default function LoginPage() {
                 {loading ? 'Signing in...' : 'Sign in'}
               </Button>
 
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => router.push('/register')}
+                className="w-full"
+              >
+                Create account
+              </Button>
+
               {showDevMockAdminLogin && (
                 <div className="rounded-[22px] border border-[var(--accent-border)] bg-[var(--accent-soft)] p-4">
                   <p className="mb-3 text-xs leading-6 text-[var(--secondary)]">
