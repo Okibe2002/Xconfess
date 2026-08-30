@@ -9,8 +9,9 @@ import { Button } from '@/app/components/ui/button';
 import { Input } from '@/app/components/ui/input';
 import { BrandLogo } from '@/app/components/brand/BrandLogo';
 import { useAuth } from '@/app/lib/hooks/useAuth';
-import { getErrorMessage } from '@/app/lib/utils/errorHandler';
+import { getErrorMessage, extractRequestId } from '@/app/lib/utils/errorHandler';
 import { getAuthFieldError } from '@/app/lib/api/authService';
+import { RequestIdNotice } from '@/app/components/auth/RequestIdNotice';
 import {
   validateRegisterForm,
   parseRegisterForm,
@@ -40,6 +41,7 @@ export default function RegisterPage() {
   const [confirmPassword, setConfirmPassword] = useState('');
   const [errors, setErrors] = useState<ValidationErrors>({});
   const [submitError, setSubmitError] = useState('');
+  const [errorRequestId, setErrorRequestId] = useState<string | undefined>();
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
@@ -56,6 +58,7 @@ export default function RegisterPage() {
     if (field === 'confirmPassword') setConfirmPassword(value);
 
     setSubmitError('');
+    setErrorRequestId(undefined);
     if (errors[field]) {
       setErrors((prev) => ({ ...prev, [field]: undefined }));
     }
@@ -68,6 +71,7 @@ export default function RegisterPage() {
     const validationErrors = validateRegisterForm(formData);
     setErrors(validationErrors);
     setSubmitError('');
+    setErrorRequestId(undefined);
 
     if (hasErrors(validationErrors)) {
       return;
@@ -90,6 +94,7 @@ export default function RegisterPage() {
     } catch (error) {
       const field = getAuthFieldError(error);
       const message = getErrorMessage(error);
+      setErrorRequestId(extractRequestId(error));
       if (field) {
         setErrors((prev) => ({ ...prev, [field]: message }));
         setSubmitError('');
@@ -148,6 +153,10 @@ export default function RegisterPage() {
               >
                 {submitError}
               </div>
+            )}
+
+            {errorRequestId && (submitError || hasErrors(errors)) && (
+              <RequestIdNotice requestId={errorRequestId} />
             )}
 
             <div className="mt-6 grid gap-4 sm:grid-cols-2">
