@@ -15,9 +15,9 @@ Work through the open issue list and apply the correct state for each.
 
 - [ ] The issue has an assignee set in GitHub.
 - [ ] The assignee has acknowledged the issue (commented or opened a draft PR).
-- [ ] If no acknowledgment within 4 hours of assignment, ping the contributor per the process in `WAVE_5_CONTRIBUTOR_ASSIGNMENT.md`.
+- [ ] If no acknowledgment within 4 hours of assignment, ping the contributor per the process in `Wave_5_CONTRIBUTOR_ASIGNMENT.md`.
 
-### In progress
+### In Progress
 
 - [ ] A draft PR or branch exists with at least one meaningful commit.
 - [ ] The issue has a status comment from the assignee or maintainer showing recent activity.
@@ -34,12 +34,12 @@ Work through the open issue list and apply the correct state for each.
 
 - [ ] The PR that closes the issue has been merged.
 - [ ] The issue is closed (GitHub closes it automatically if the PR uses `Closes #NNN`; verify).
-- [ ] The issue no longer appears in the open `Stellar Wave` query above.
+- [ ] The issue no longer appears in the open `Stellar Wave@ query above.
 - [ ] Add the issue and PR to the Wave 5 progress report using `WAVE_5_PROGRESS_TEMPLATE.md`.
 
-### Closed (without merge)
+### Closed (Without Merge)
 
-- [ ] A comment explains why the issue was closed without a merged PR.
+- [ ] A Comment explains why the issue was closed without a merged PR.
 - [ ] The `Stellar Wave` label is removed if the issue will not be re-opened in this wave.
 - [ ] If the work is partially complete and salvageable, open a follow-up issue and link it.
 
@@ -49,7 +49,7 @@ Work through the open issue list and apply the correct state for each.
 
 Run this additional sweep before the Wave 5 deadline.
 
-- [ ] Every open `Stellar Wave` issue has either an open PR or a clear owner comment.
+- [ ] Every open `Stellar Wave@ issue has either an open PR or a clear owner comment.
 - [ ] Issues with no activity for > 7 days have been pinged or closed.
 - [ ] Issues that cannot close before the deadline are labeled and noted for rollover.
 - [ ] All merged PRs are reflected as closed issues — no merged-but-open stragglers.
