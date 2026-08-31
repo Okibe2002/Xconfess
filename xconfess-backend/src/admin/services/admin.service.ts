@@ -736,14 +736,14 @@ export class AdminService {
       ...confessions.slice(0, 20).map((confession: any) => ({
         id: confession.id,
         type: "confession",
-        label: "Published Confession",
+        label: "Published confession",
         createdAt: confession.created_at || confession.createdAt,
         summary: confession.message,
       })),
       ...reports.slice(0, 20).map((report: any) => ({
         id: report.id,
         type: "report",
-        label: "Submitted Report",
+        label: "Submitted report",
         createdAt: report.createdAt,
         summary: report.reason || report.type,
       })),
