@@ -10,7 +10,7 @@
 export const ANALYTICS_PRIVACY = {
   /**
    * Minimum number of records in any aggregated cohort.
-   * Examples: Daily active users, Daily confession count, Reaction type count.
+   * Examples: Daily Active Users, Daily Confession Count, Reaction Type Count.
    *
    * Set to 5 (balanced trade-off between privacy and utility):
    * - Prevents single-user or 2-3 user buckets from being exposed
