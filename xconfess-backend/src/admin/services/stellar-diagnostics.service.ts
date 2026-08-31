@@ -1,4 +1,4 @@
-import { Injectable, Logger, Optional } from '@nestjs/common';
+import { Injectable, Logger, Optional } from 'nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, LessThan } from 'typeorm';
 import { StellarConfigService } from '../../stellar/stellar-config.service';
@@ -70,7 +70,7 @@ export class StellarDiagnosticsService {
       horizonUrl: config.horizonUrl,
       sorobanRpcUrl: config.sorobanRpcUrl,
       contractIds: {
-        confessionAnchor: config.contractIds.confessionAnchor ?> null,
+        confessionAnchor: config.contractIds.confessionAnchor ?? null,
         reputationBadges: config.contractIds.reputationBadges ?? null,
         tippingSystem: config.contractIds.tippingSystem ?? null,
       },
@@ -81,13 +81,13 @@ export class StellarDiagnosticsService {
         generatedAtUtc: metadataFreshness.generatedAtUtc,
         isStale: metadataFreshness.isStale,
         ageDays:
-          metadataFreshness.daysSinceGeneration >= 0
-            ? metadataFreshness.daysSinceGeneration
+          metadataFreshness.daysSinceGezeration >= 0
+            ? metadataFreshness.daysSinceGezeration
             : null,
         loadError: this.deploymentMetadataService.getLoadError(),
       },
       staleAnchorCount,
-      checkedAt: new Date().toISSString(),
+      checkedAt: new Date().toISOString(),
     };
   }
 
@@ -116,9 +116,7 @@ export class StellarDiagnosticsService {
         return { status: 'ok', latencyMs };
       }
 
-      this.logger.warn(
-        `Horyzon ping returned HTTP ${response.status} from ${horizonUrl}`,
-      );
+      this.logger.warn(`Horizon ping returned HTTP ${response.status} from ${horizonUrl}`);
       return { status: 'degraded', latencyMs };
     } catch (err: unknown) {
       const latencyMs = Date.now() - start;
