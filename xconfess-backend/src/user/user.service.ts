@@ -2,10 +2,10 @@ import {
   Inject,
   Injectable,
   InternalServerErrorException,
-  ConflictException,
   NotFoundException,
   Logger,
   forwardRef,
+  HttpStatus,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -25,6 +25,8 @@ import {
 } from './dto/user-activity.dto';
 import { decryptConfession } from '../utils/confession-encryption';
 import { ConfigService } from '@nestjs/config';
+import { AppException } from '../common/errors/app-exception';
+import { ErrorCode } from '../common/errors/error-codes';
 
 @Injectable()
 export class UserService {
@@ -82,11 +84,33 @@ export class UserService {
     email: string,
     password: string,
     username: string,
+    requestId?: string,
   ): Promise<User> {
+    // Correlation suffix for log lines so a failed registration can be traced
+    // from the frontend x-request-id to backend logs (#1730). Never log the
+    // email, password, or username values themselves.
+    const trace = requestId ? ` [requestId=${requestId}]` : '';
+
     const normalizedEmail = email.trim().toLowerCase();
     const existing = await this.findByEmail(normalizedEmail);
     if (existing) {
-      throw new ConflictException('Email already in use');
+      this.logger.warn(`Registration rejected: email already in use${trace}`);
+      throw new AppException(
+        'An account with this email already exists.',
+        ErrorCode.ALREADY_EXISTS,
+        HttpStatus.CONFLICT,
+        { field: 'email' },
+      );
+    }
+    const existingUsername = await this.findByUsername(username);
+    if (existingUsername) {
+      this.logger.warn(`Registration rejected: username already taken${trace}`);
+      throw new AppException(
+        'This username is already taken.',
+        ErrorCode.ALREADY_EXISTS,
+        HttpStatus.CONFLICT,
+        { field: 'username' },
+      );
     }
 
     try {
@@ -112,15 +136,35 @@ export class UserService {
           savedUser.username,
         );
       } catch (err) {
-        // Ignore email sending failures as they shouldn't block user creation
+        // Ignore email sending failures as they shouldn't block user creation.
+        // Reference the new user by id — never log the email address.
         this.logger.warn(
-          `Failed to send welcome email to ${normalizedEmail}: ${
+          `Failed to send welcome email for user ${savedUser.id}${trace}: ${
             err instanceof Error ? err.message : err
           }`,
         );
       }
       return savedUser;
-    } catch {
+    } catch (error) {
+      if (error instanceof AppException) {
+        throw error;
+      }
+      if ((error as { code?: string })?.code === '23505') {
+        this.logger.warn(
+          `Registration rejected: unique constraint violation${trace}`,
+        );
+        throw new AppException(
+          'Email or username already in use.',
+          ErrorCode.ALREADY_EXISTS,
+          HttpStatus.CONFLICT,
+        );
+      }
+      this.logger.error(
+        `Failed to create user${trace}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        error instanceof Error ? error.stack : undefined,
+      );
       throw new InternalServerErrorException('Failed to create user');
     }
   }
@@ -204,6 +248,12 @@ export class UserService {
 
     user.is_active = true;
     return this.userRepository.save(user);
+  }
+
+  async deleteAccount(userId: number): Promise<void> {
+    const user = await this.findById(userId);
+    if (!user) throw new NotFoundException('User not found');
+    await this.userRepository.remove(user);
   }
 
   // =========================
@@ -733,5 +783,102 @@ export class UserService {
       this.logger.error(`Failed to aggregate user activity: ${error.message}`, error.stack);
       return { data: [], meta: { total: 0, page, limit, totalPages: 0 } };
     }
+  }
+
+  async updateSettings(
+    userId: number,
+    dto: Record<string, any>,
+  ): Promise<User> {
+    const user = await this.findById(userId);
+    if (!user) throw new NotFoundException('User not found');
+
+    if (dto.privacySettings) {
+      user.privacySettings = {
+        ...user.privacySettings,
+        ...dto.privacySettings,
+      };
+    }
+
+    if (dto.notificationPreferences) {
+      user.notificationPreferences = {
+        ...user.notificationPreferences,
+        ...dto.notificationPreferences,
+      };
+    }
+
+    for (const key of Object.keys(dto)) {
+      if (
+        key !== 'privacySettings' &&
+        key !== 'notificationPreferences' &&
+        key in user
+      ) {
+        (user as any)[key] = dto[key];
+      }
+    }
+
+    await this.userRepository.save(user);
+    await this.enforcePrivacyPolicies(user);
+    return user;
+  }
+
+  async getPublicProfile(userId: string | number): Promise<any> {
+    const numericId = typeof userId === 'string' ? parseInt(userId, 10) : userId;
+    if (isNaN(numericId)) {
+      throw new NotFoundException('User not found');
+    }
+    const user = await this.findById(numericId);
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    const anonRows = await this.userRepository.manager.query(
+      'SELECT anonymous_user_id as id FROM user_anonymous_users WHERE user_id = $1',
+      [numericId],
+    );
+    const anonIds = anonRows.map((row: { id: string }) => row.id);
+
+    let stats = {
+      confessions: 0,
+      reactions: 0,
+      comments: 0,
+      tipsReceived: 0,
+    };
+
+    if (anonIds.length > 0) {
+      const [statsRow] = await this.userRepository.manager.query(
+        `
+        SELECT
+          (SELECT COUNT(*)::int FROM anonymous_confessions c
+            WHERE c.anonymous_user_id = ANY($1) AND c."isDeleted" = false) AS confessions,
+          (SELECT COUNT(*)::int FROM reaction r
+            JOIN anonymous_confessions c ON c.id = r.confession_id
+            WHERE c.anonymous_user_id = ANY($1) AND c."isDeleted" = false) AS reactions,
+          (SELECT COUNT(*)::int FROM comments com
+            JOIN anonymous_confessions c ON c.id = com."confessionId"
+            WHERE c.anonymous_user_id = ANY($1) AND com."isDeleted" = false) AS comments,
+          (SELECT COALESCE(SUM(t.amount), 0)::float FROM tips t
+            JOIN anonymous_confessions c ON c.id = t.confession_id
+            WHERE c.anonymous_user_id = ANY($1)) AS tips_received
+        `,
+        [anonIds],
+      );
+      stats = {
+        confessions: Number(statsRow?.confessions ?? 0),
+        reactions: Number(statsRow?.reactions ?? 0),
+        comments: Number(statsRow?.comments ?? 0),
+        tipsReceived: Number(statsRow?.tips_received ?? 0),
+      };
+    }
+
+    const badges = this.buildReputationBadges(stats.confessions);
+
+    return {
+      displayName: user.username,
+      username: user.username,
+      avatar: null,
+      createdAt: user.createdAt,
+      stats,
+      badges,
+    };
   }
 }

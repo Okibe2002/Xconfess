@@ -2,14 +2,15 @@ import { normalizeConfession } from "../../lib/utils/normalizeConfession";
 import { createApiErrorResponse } from "@/lib/apiErrorHandler";
 import { getApiBaseUrl } from "@/app/lib/config";
 import { getOrCreateRequestId, requestIdResponseHeaders } from "@/app/lib/utils/requestId";
+import { methodNotAllowedHandlers } from "@/app/lib/api/proxy";
 
-const BASE_API_URL = getApiBaseUrl();
 export async function POST(request: Request) {
+  const BASE_API_URL = getApiBaseUrl();
   const correlationId = getOrCreateRequestId(request);
 
   try {
     const body = await request.json();
-    const { title, message, body: bodyContent, gender, stellarTxHash } = body;
+    const { title, message, body: bodyContent, gender, stellarTxHash, idempotencyKey } = body;
 
     if (!message && !bodyContent) {
       return createApiErrorResponse("Confession content is required", { 
@@ -29,14 +30,29 @@ export async function POST(request: Request) {
     if (title) backendBody.title = title;
     if (gender) backendBody.gender = gender;
     if (stellarTxHash) backendBody.stellarTxHash = stellarTxHash;
+    if (idempotencyKey) backendBody.idempotencyKey = idempotencyKey;
+
+    // Forward client-supplied Idempotency-Key header or fall back to body field.
+    const clientIdempotencyKey =
+      request.headers.get("idempotency-key") ||
+      request.headers.get("Idempotency-Key") ||
+      idempotencyKey;
+
+    const forwardHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      "x-request-id": correlationId,
+    };
+
+    if (clientIdempotencyKey) {
+      forwardHeaders["Idempotency-Key"] = clientIdempotencyKey;
+      // Also include in body for backends that read it from there.
+      backendBody.idempotencyKey = clientIdempotencyKey;
+    }
 
     try {
       const response = await fetch(backendUrl, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-request-id": correlationId,
-        },
+        headers: forwardHeaders,
         body: JSON.stringify(backendBody),
       });
 
@@ -76,6 +92,7 @@ export async function POST(request: Request) {
 }
 
 export async function GET(request: Request) {
+  const BASE_API_URL = getApiBaseUrl();
   const { searchParams } = new URL(request.url);
   const page = Math.max(1, parseInt(searchParams.get("page") ?? "1") || 1);
   const limit = Math.max(1, parseInt(searchParams.get("limit") ?? "10") || 10);
@@ -154,4 +171,6 @@ export async function GET(request: Request) {
     });
   }
 }
+
+export const { PUT, PATCH, DELETE } = methodNotAllowedHandlers(["GET", "POST"]);
 

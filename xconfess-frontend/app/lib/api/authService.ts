@@ -20,13 +20,15 @@ import {
 } from '@/lib/normalizeAuthError';
 import { getApiBaseUrl } from '@/app/lib/config';
 
-const API_URL = getApiBaseUrl();
+export type AuthFieldError = 'email' | 'username' | 'password' | 'confirmPassword';
 
 /**
- * Axios instance for API calls
+ * Axios instance for proxy API calls.
+ * baseURL is set to the Next.js origin so that all paths are relative to /api/*.
+ * The proxy routes (app/api/**) handle forwarding requests to the backend.
  */
 const apiClient: AxiosInstance = axios.create({
-  baseURL: API_URL,
+  baseURL: typeof window === 'undefined' ? getApiBaseUrl() : '',
   headers: {
     'Content-Type': 'application/json',
   },
@@ -67,6 +69,35 @@ apiClient.interceptors.response.use(
 );
 
 /**
+ * Pull the correlation / request id out of a proxy error response so failed
+ * auth attempts can surface it to the user for log tracing (issue #1729).
+ * Prefers the `x-request-id` response header, then common body fields.
+ */
+export function extractResponseRequestId(
+  response: Pick<Response, 'headers'>,
+  body?: unknown,
+): string | undefined {
+  // Header names are case-insensitive per the Fetch spec.
+  const headerId =
+    response.headers.get('x-request-id') ||
+    response.headers.get('x-correlation-id');
+  if (headerId && headerId.trim().length > 0) {
+    return headerId.trim();
+  }
+
+  if (body && typeof body === 'object') {
+    const record = body as Record<string, unknown>;
+    const bodyId =
+      record.requestId ?? record.request_id ?? record.correlationId;
+    if (typeof bodyId === 'string' && bodyId.trim().length > 0) {
+      return bodyId.trim();
+    }
+  }
+
+  return undefined;
+}
+
+/**
  * Authentication API service
  */
 export const authApi = {
@@ -94,6 +125,7 @@ export const authApi = {
             responseBody: body,
             path: '/api/auth/session',
             normalized,
+            requestId: extractResponseRequestId(response, body),
           });
           logError(appError, 'authApi.login', { status: response.status });
           throw appError;
@@ -115,6 +147,7 @@ export const authApi = {
           path: '/api/auth/session',
           upstreamMessage:
             typeof rawApi === 'string' ? rawApi : undefined,
+          requestId: extractResponseRequestId(response, body),
         });
         logError(apiError, 'authApi.login', { status, url: '/api/auth/session' });
         throw apiError;
@@ -130,14 +163,32 @@ export const authApi = {
   },
 
   /**
-   * Register new user
+   * Register new user via the /api/users/register proxy route
    * @param data - Registration data (email, password, username)
    * @returns Registered user data
    */
   async register(data: RegisterData): Promise<RegisterResponse> {
     try {
-      const response = await apiClient.post<RegisterResponse>('/users/register', data);
-      return response.data;
+      const response = await fetch('/api/users/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        const message =
+          (body as any)?.message ?? `Registration failed (${response.status})`;
+        const field = extractAuthFieldError(body);
+        throw new AppError(message, (body as any)?.code ?? 'REGISTER_FAILED', response.status, {
+          responseBody: body,
+          path: '/api/users/register',
+          field,
+          requestId: extractResponseRequestId(response, body),
+        });
+      }
+
+      return response.json() as Promise<RegisterResponse>;
     } catch (error) {
       const appError =
         error instanceof AppError
@@ -167,7 +218,9 @@ export const authApi = {
             path: '/api/auth/session',
             normalized,
           });
-          logError(appError, 'authApi.getCurrentUser', { status: response.status });
+          if (!isExpectedMissingSession(appError)) {
+            logError(appError, 'authApi.getCurrentUser', { status: response.status });
+          }
           throw appError;
         }
 
@@ -179,7 +232,9 @@ export const authApi = {
           path: '/api/auth/session',
           action: 'getCurrentUser',
         });
-        logError(appError, 'authApi.getCurrentUser', { status, url: '/api/auth/session' });
+        if (!(status === 401 && code === 'UNAUTHORIZED')) {
+          logError(appError, 'authApi.getCurrentUser', { status, url: '/api/auth/session' });
+        }
         throw appError;
       }
       const data = await response.json();
@@ -189,7 +244,9 @@ export const authApi = {
         error instanceof AppError
           ? error
           : toAppError(error, 'Failed to get user data');
-      logError(appError, 'authApi.getCurrentUser');
+      if (!(appError instanceof AppError && isExpectedMissingSession(appError))) {
+        logError(appError, 'authApi.getCurrentUser');
+      }
       throw appError;
     }
   },
@@ -215,6 +272,42 @@ function isNormalizedAuthError(body: any): body is NormalizedAuthError {
     'message' in body &&
     'retryable' in body &&
     (body.type === 'TRANSIENT' || body.type === 'TERMINAL')
+  );
+}
+
+export function getAuthFieldError(error: unknown): AuthFieldError | undefined {
+  if (!(error instanceof AppError)) return undefined;
+  return extractAuthFieldError(error.details?.responseBody) ?? extractAuthFieldError(error.details);
+}
+
+function extractAuthFieldError(body: unknown): AuthFieldError | undefined {
+  if (!body || typeof body !== 'object') return undefined;
+
+  const details = 'details' in body ? (body as { details?: unknown }).details : body;
+  if (!details || typeof details !== 'object') return undefined;
+
+  const field = (details as { field?: unknown }).field;
+  return isAuthFieldError(field) ? field : undefined;
+}
+
+function isAuthFieldError(field: unknown): field is AuthFieldError {
+  return (
+    field === 'email' ||
+    field === 'username' ||
+    field === 'password' ||
+    field === 'confirmPassword'
+  );
+}
+
+function isExpectedMissingSession(error: AppError): boolean {
+  const normalized = (error.details as any)?.normalized as
+    | NormalizedAuthError
+    | undefined;
+
+  return (
+    error.statusCode === 401 &&
+    error.code === 'INVALID_SESSION' &&
+    normalized?.type === 'TERMINAL'
   );
 }
 

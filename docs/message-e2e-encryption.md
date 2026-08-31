@@ -52,7 +52,13 @@ Stored in `messages.content` and `messages.replyContent`:
 }
 ```
 
-The API rejects plaintext bodies for create/reply operations.
+The API rejects plaintext bodies for create/reply operations. Envelope parsing
+is strict: the payload must be a JSON object with exactly the four fields
+above (no extra fields), `iv` must be base64url and decode to exactly 12
+bytes, and `ct` must be base64url and decode to at least 16 bytes (the
+minimum possible AES-GCM auth tag). Payloads that are well-formed JSON but
+fail any of these checks — wrong algorithm, wrong nonce length, truncated
+ciphertext, or unexpected fields — are rejected the same as plaintext.
 
 ## Key exchange flow
 
@@ -84,9 +90,27 @@ sequenceDiagram
 
 ## Key storage and recovery
 
+### Current key lifecycle
+
+1. When a session first opens Messages, the client requests its key status from
+   `GET /api/messages/keys/me`.
+2. If neither the server nor IndexedDB has a key for that anonymous identity,
+   the browser generates an X25519 pair, saves it locally, and registers only
+   its public key with `PUT /api/messages/keys`.
+3. Subsequent visits use the private key stored under that anonymous identity
+   in IndexedDB. The server stores the current public key, its version, and an
+   optional encrypted backup; it never receives the private key or recovery
+   passphrase.
+4. The client fetches a peer's current public key whenever it encrypts or
+   decrypts a thread. There is no server-held copy of historical private keys.
+
 ### Default (device-bound)
 
-Private keys live in IndexedDB. Clearing site data or switching browsers generates a **new** key pair on next visit. Old messages become unreadable unless a backup exists.
+Private keys live in IndexedDB. Clearing site data or switching browsers leaves
+the device without its private key. If the server already has a public key for
+that identity, the client enters recovery mode instead of generating a
+replacement key. Old messages are unreadable unless the private key is
+restored from a backup.
 
 ### Optional passphrase backup
 
@@ -105,9 +129,11 @@ Restore on a new device:
 
 ### New device, no backup
 
-- A fresh key pair is generated and registered (`messageKeyVersion` increments if public key changes).
+- If this identity has never registered a public key, a fresh key pair is generated and registered automatically (nothing to lose).
+- If a public key is **already registered** for this identity (e.g. the user messaged from another device) but this device has no matching local private key, the client does **not** silently generate and register a replacement key — doing so would overwrite the registered public key and make existing messages permanently unreadable. Instead the UI shows a blocking notice offering to restore from a passphrase backup or to explicitly "start fresh" (with a confirmation, since it is irreversible).
 - **Historical messages remain ciphertext** — the UI shows: `[Unable to decrypt — wrong device or missing recovery key]`.
 - New messages work after both parties fetch the new public keys.
+- If no recovery backup has been configured yet, the Messages page shows a persistent reminder to set one up before it's needed.
 
 ### New device, with backup
 
@@ -122,7 +148,24 @@ Restore on a new device:
 ### Key rotation
 
 - Registering a different `publicKey` for the same anonymous identity increments `messageKeyVersion`.
-- Messages encrypted to an older key remain decryptable only with the matching private key.
+- The current API keeps one public key per anonymous identity. It does not
+  retain previous public keys or attach a key version to individual message
+  envelopes.
+- Messages encrypted to an older key remain decryptable only with the matching
+  private key and the peer public key used when they were encrypted. Replacing
+  a public key can therefore make historical messages undecryptable in the
+  current client, even if a participant still has an old private key.
+- Rotation is intentionally manual today: it happens only when a user confirms
+  **Start fresh** after recovery is unavailable. The client never silently
+  rotates a key merely because IndexedDB is empty.
+
+### Rotation follow-up
+
+Automatic or routine rotation is not implemented. A future rotation design
+must preserve a versioned public-key history and record recipient key versions
+with each envelope (or use per-message key wrapping). It must also provide a
+safe migration and recovery flow before making rotation available outside the
+explicit destructive **Start fresh** action.
 
 ### Notifications
 
@@ -139,8 +182,10 @@ Restore on a new device:
 
 ## Tests
 
-- **Unit**: `xconfess-backend/src/messages/crypto/message-e2e.crypto.spec.ts` — ECDH, encrypt/decrypt, tampering, backup wrap/unwrap, lost-key simulation.
+- **Unit**: `xconfess-backend/src/messages/crypto/message-e2e.crypto.spec.ts` — ECDH, encrypt/decrypt, tampering, malformed/replayed envelope rejection, backup wrap/unwrap, lost-key simulation.
+- **Unit**: `xconfess-backend/src/messages/messages.service.spec.ts` — rejects plaintext and malformed envelopes on `create`, persists valid envelopes.
 - **E2E**: `xconfess-backend/test/message-e2e-key-exchange.e2e-spec.ts` — key registration, encrypted send/reply through the HTTP layer.
+- **Frontend**: `xconfess-frontend/app/lib/hooks/__tests__/useMessageE2E.test.ts` — first-run key generation, lost-key recovery prompt (no silent overwrite), restore-from-backup, start-fresh confirmation, and that the recovery passphrase is never logged.
 
 Run:
 
