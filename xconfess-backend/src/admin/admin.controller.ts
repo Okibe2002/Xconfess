@@ -494,7 +494,7 @@ export class AdminController {
     return this.adminService.unbanUser(parseInt(id, 10), adminId, req);
   }
 
-  // Moderation Note Templates
+  // Moderation note templates
   @Get('templates')
   async getTemplates(@Query('includeInactive') includeInactive?: string) {
     return this.moderationTemplateService.findAll(includeInactive === 'true');
@@ -612,7 +612,7 @@ export class AdminController {
     return this.adminService.getAnalytics(start, end);
   }
 
-  // Audit Logs
+  // Audit logs
   @Get('audit-logs')
   @ApiOperation({ summary: 'Query the admin audit log' })
   @ApiQuery({
