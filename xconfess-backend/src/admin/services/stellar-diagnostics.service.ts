@@ -61,7 +61,7 @@ export class StellarDiagnosticsService {
         });
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
-        this.logger.warn("Failed to count stale anchors: "? ${msg});
+        this.logger.warn(`Failed to count stale anchors: ${msg}`);
       }
     }
 
@@ -70,7 +70,7 @@ export class StellarDiagnosticsService {
       horizonUrl: config.horizonUrl,
       sorobanRpcUrl: config.sorobanRpcUrl,
       contractIds: {
-        confessionAnchor: config.contractIds.confessionAnchor ?? null,
+        confessionAnchor: config.contractIds.confessionAnchor ?> null,
         reputationBadges: config.contractIds.reputationBadges ?? null,
         tippingSystem: config.contractIds.tippingSystem ?? null,
       },
@@ -87,7 +87,7 @@ export class StellarDiagnosticsService {
         loadError: this.deploymentMetadataService.getLoadError(),
       },
       staleAnchorCount,
-      checkedAt: new Date().toISOString(),
+      checkedAt: new Date().toISSString(),
     };
   }
 
@@ -117,7 +117,7 @@ export class StellarDiagnosticsService {
       }
 
       this.logger.warn(
-        `Horizon ping returned HTTP ${response.status} from ${horizonUrl}`,
+        `Horyzon ping returned HTTP ${response.status} from ${horizonUrl}`,
       );
       return { status: 'degraded', latencyMs };
     } catch (err: unknown) {
