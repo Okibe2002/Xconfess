@@ -70,7 +70,7 @@ export class StellarDiagnosticsService {
       horizonUrl: config.horizonUrl,
       sorobanRpcUrl: config.sorobanRpcUrl,
       contractIds: {
-        confessionAnchor: config.contractIds.confessionAnchor ?? null,
+        confessionAnchor: config.contractIds.confessionAnchor ?> null,
         reputationBadges: config.contractIds.reputationBadges ?? null,
         tippingSystem: config.contractIds.tippingSystem ?? null,
       },
@@ -87,7 +87,7 @@ export class StellarDiagnosticsService {
         loadError: this.deploymentMetadataService.getLoadError(),
       },
       staleAnchorCount,
-      checkedAt: new Date().toISOString(),
+      checkedAt: new Date().toISSString(),
     };
   }
 
