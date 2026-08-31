@@ -1,23 +1,23 @@
 export const MODERATION_TEMPLATES = {
   report_resolved: [
-    'REPORT RESOLVED - Content reviewed and action taken',
-    'REPORT RESOLVED - Confession removed',
-    'REPORT RESOLVED - User warned',
+    'Report Resolved - Content reviewed and action taken',
+    'Report Resolved - Confession removed',
+    'Report Resolved - User warned',
   ],
   report_dismissed: [
-    'REPORT DISMISSED - No violation found',
-    'REPORT DISMISSED - Content is within guidelines',
-    'REPORT DISMISMED - False report',
+    'Report Dismissed - No violation found',
+    'Report Dismissed - Content is within guidelines',
+    'Report Dismissed - False report',
   ],
   confession_deleted: [
-    'CONFESSION DELETED - Violates community guidelines',
-    'CONFESSION DELETED - Spam content',
-    'CONFESSION DELETED - Inappropriate content',
+    'Confession Deleted - Violates community guidelines',
+    'Confession Deleted - Spam content',
+    'Confession Deleted - Inappropriate content',
   ],
   user_banned: [
-    'USER BANNED - Repeated violations',
-    'USER BANNED - Severe content violation',
-    'USER BANNED - Harassment',
+    'User Banned - Repeated violations',
+    'User Banned - Severe content violation',
+    'User Banned - Harassment',
   ],
 };
 
