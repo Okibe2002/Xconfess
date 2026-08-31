@@ -194,12 +194,10 @@ export default function LoginPage() {
 
               <Button
                 type="button"
-                onClick={() => router.push(buildAuthSwitchUrl('/register'))}
-                disabled={loading}
                 variant="outline"
+                onClick={() => router.push('/register')}
                 className="w-full"
               >
-                <UserPlus className="h-4 w-4" aria-hidden="true" />
                 Create account
               </Button>
 
