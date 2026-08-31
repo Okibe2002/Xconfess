@@ -309,7 +309,7 @@ export class AdminController {
   @UseGuards(StepUpGuard)
   @HttpCode(HttpStatus.OK)
   @UseGuards(StepUpGuard)
-  @ApiOperation({ summary: 'Admin-delete a confession' })
+  @ApiOperation({ summary: 'Delete a confession (admin action)' })
   @ApiParam({ name: 'id', description: 'Confession UUID' })
   @ApiBody({ schema: { example: { reason: 'Violates community standards.' } } })
   @ApiResponse({
